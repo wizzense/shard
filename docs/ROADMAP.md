@@ -1,64 +1,64 @@
-# shard roadmap
+# Shard roadmap
 
-phased so the riskiest thing is proven first and cheaply. each phase has one goal and a hard pass/fail.
+Phased so the riskiest thing is proven first and cheaply. Each phase has one goal and a hard pass/fail.
 
-## phase 0 — prove the transport (target: 1-2 days)
+## Phase 0 — prove the transport (target: 1-2 days)
 
-the single hardest thing: reliably serve tokens through a multi-stage split. do it on easy mode first.
+The single hardest thing: reliably serve tokens through a multi-stage split. Do it on easy mode first.
 
-- 2 nodes, **same lan** (or two boxes in the same datacenter), low latency.
-- split one model that genuinely needs 2 gpus across them with our own quic transport moving activations.
-- no speculative decoding yet. plain token-by-token is fine, it'll be slow, that's expected.
-- **pass = a coherent completion comes out, reliably, 20 times in a row, with a measured tok/s.**
+- 2 nodes, **same LAN** (or two boxes in the same datacenter), low latency.
+- Split one model that genuinely needs 2 GPUs across them with our own QUIC transport moving activations.
+- No speculative decoding yet. Plain token-by-token is fine, it'll be slow, that's expected.
+- **Pass = a coherent completion comes out, reliably, 20 times in a row, with a measured tok/s.**
 
-**✓ PASSED (2026-06-15).** 2-node split with per-node kv-cache. proven on Qwen2.5-14B (29.5GB bf16, OOMs one 24GB card) split 24/24 across two 4090s: 20/20 clean completions, ~17 tok/s decode, via our own tcp transport. code in `phase0/` (`node_kv.py` = the split node, `bench.py` = the 20x reliability harness). caveat: nodes are on a low-latency same-host link, not wan yet.
+**✓ PASSED (2026-06-15).** 2-node split with per-node KV-cache. Proven on Qwen2.5-14B (29.5GB bf16, OOMs one 24GB card) split 24/24 across two 4090s: 20/20 clean completions, ~17 tok/s decode, via our own TCP transport. Code in `phase0/` (`node_kv.py` = the split node, `bench.py` = the 20x reliability harness). Caveat: nodes are on a low-latency same-host link, not WAN yet.
 
-**hardened (2026-06-15):** the transport is now fail-fast and instrumented — the direct answer to an opaque "broken pipe". per-edge socket timeouts (a dead OR frozen node raises a `TransportError` with context — which peer, which decode step, dropped vs timed-out — never an unbounded `recv`); `os._exit` on unrecoverable failure so the process dies in ms, not after a ~10s torch/cuda teardown; per-edge health logging (round-trip latency + uplink MB). verified by killing (SIGKILL) and freezing (SIGSTOP) the tail mid-generation — head fails cleanly both ways, no hang. this pre-validates part of phase 1's edge-supervision goal on the easy link.
+**Hardened (2026-06-15):** the transport is now fail-fast and instrumented — the direct answer to the opaque-transport failure mode, a black-box edge that just returns "broken pipe". Per-edge socket timeouts (a dead OR frozen node raises a `TransportError` with context — which peer, which decode step, dropped vs timed-out — never an unbounded `recv`); `os._exit` on unrecoverable failure so the process dies in ms, not after a ~10s torch/cuda teardown; per-edge health logging (round-trip latency + uplink MB). Verified by killing (SIGKILL) and freezing (SIGSTOP) the tail mid-generation — head fails cleanly both ways, no hang. This pre-validates part of Phase 1's edge-supervision goal on the easy link.
 
-this was the thing that blocked us all day. it's the momentum milestone.
+This was the thing that blocked us all day. It's the momentum milestone.
 
-## phase 1 — make the transport survive wan (target: 3-5 days)
+## Phase 1 — make the transport survive WAN (target: 3-5 days)
 
-- same 2 nodes, now on **different networks behind nat**.
-- add hole-punching via a rendezvous (c0mpute orchestrator), relay fallback for symmetric nat.
-- add fp8/int8 activation quantization to cut uplink bandwidth.
-- add edge supervision: kill a node mid-stream, confirm the pipeline detects it and the request fails cleanly (not a hang).
-- **pass = reliable wan serving + an honest wan tok/s number** (will be latency-bound and slow, that's the point, it sets the baseline spec-decode has to beat).
+- Same 2 nodes, now on **different networks behind NAT**.
+- Add hole-punching via a rendezvous (c0mpute orchestrator), relay fallback for symmetric NAT.
+- Add fp8/int8 activation quantization to cut uplink bandwidth.
+- Add edge supervision: kill a node mid-stream, confirm the pipeline detects it and the request fails cleanly (not a hang).
+- **Pass = reliable WAN serving + an honest WAN tok/s number** (will be latency-bound and slow, that's the point, it sets the baseline spec-decode has to beat).
 
-## phase 2 — speculative decoding (target: ~1 week)
+## Phase 2 — speculative decoding (target: ~1 week)
 
-the payoff. add the draft-verify loop.
+The payoff. Add the draft-verify loop.
 
-- small draft model on the entry node, propose K, verify K across the swarm in one traversal.
-- adaptive K based on measured latency + live acceptance rate.
-- **pass = land in the paper's regime: meaningfully more tok/s than phase 1 on the same links, in the ~8-9 tok/s ballpark at 80ms for a small target.** this is the proof the whole approach is real.
+- Small draft model on the entry node, propose K, verify K across the swarm in one traversal.
+- Adaptive K based on measured latency + live acceptance rate.
+- **Pass = land in the paper's regime: meaningfully more tok/s than Phase 1 on the same links, in the ~8-9 tok/s ballpark at 80ms for a small target.** This is the proof the whole approach is real.
 
-## phase 3 — permissionless swarm + c0mpute (target: 1-2 weeks)
+## Phase 3 — permissionless swarm + c0mpute (target: 1-2 weeks)
 
-- one-line installer, auto-installs deps, plug and play.
-- `cwt_` worker auth, per-token usdc payout for a node's contribution.
-- dynamic layer allocation across **4+ heterogeneous** consumer gpus for a real **100B+** target.
-- scheduler handles joins/leaves and rebuilds the pipeline live.
-- **pass = a stranger runs one command, their gpu joins, takes a layer block, and earns for tokens it helped produce.**
+- One-line installer, auto-installs deps, plug and play.
+- `cwt_` worker auth, per-token USDC payout for a node's contribution.
+- Dynamic layer allocation across **4+ heterogeneous** consumer GPUs for a real **100B+** target.
+- Scheduler handles joins/leaves and rebuilds the pipeline live.
+- **Pass = a stranger runs one command, their GPU joins, takes a layer block, and earns for tokens it helped produce.**
 
-## phase 4 — privacy + hardening (ongoing)
+## Phase 4 — privacy + hardening (ongoing)
 
-- boundary-layer pinning (keep the leaky embedding + final layers on trusted nodes).
-- per-request "trusted nodes only" option.
-- fault tolerance: node drops mid-generation are recovered, not just failed.
-- security pass on the rendezvous + transport.
-- the privacy claim earns its word here, phase by phase, never overclaimed earlier.
+- Boundary-layer pinning (keep the leaky embedding + final layers on trusted nodes).
+- Per-request "trusted nodes only" option.
+- Fault tolerance: node drops mid-generation are recovered, not just failed.
+- Security pass on the rendezvous + transport.
+- The privacy claim earns its word here, phase by phase, never overclaimed earlier.
 
-## the honest risk register
+## The honest risk register
 
-- **wan transport across arbitrary nat is genuinely hard.** a funded team didn't nail it. we de-risk by owning + instrumenting the layer and proving it on lan first.
-- **spec-decode acceptance rate over real links sets the real tok/s.** if the draft is weak or the domain is hard, fewer tokens accept and the number drops. mitigate: good draft model, adaptive K, measure honestly.
-- **privacy vs the pillar.** the leak is real. boundary pinning helps, full privacy is research. do not sell what isn't true yet.
-- **scope.** this is multi-week serious engineering, not a weekend. the phasing means we learn whether it works in days (phase 0), not at the end.
+- **WAN transport across arbitrary NAT is genuinely hard.** A funded team didn't nail it. We de-risk by owning + instrumenting the layer and proving it on LAN first.
+- **Spec-decode acceptance rate over real links sets the real tok/s.** If the draft is weak or the domain is hard, fewer tokens accept and the number drops. Mitigate: good draft model, adaptive K, measure honestly.
+- **Privacy vs the pillar.** The leak is real. Boundary pinning helps, full privacy is research. Do not sell what isn't true yet.
+- **Scope.** This is multi-week serious engineering, not a weekend. The phasing means we learn whether it works in days (Phase 0), not at the end.
 
-## what we need
+## What we need
 
-- 2 gpu boxes for phase 0-1 (we have vast boxes up now, keep 2, drop the rest to stop the spend).
-- a draft model: small, uncensored, target-compatible tokenizer.
-- the c0mpute orchestrator as rendezvous + scheduler host (already running).
-- a model to start with that needs exactly 2 gpus for phase 0 (pick during phase 0 setup).
+- 2 GPU boxes for Phase 0-1 (we have Vast boxes up now, keep 2, drop the rest to stop the spend).
+- A draft model: small, uncensored, target-compatible tokenizer.
+- The c0mpute orchestrator as rendezvous + scheduler host (already running).
+- A model to start with that needs exactly 2 GPUs for Phase 0 (pick during Phase 0 setup).

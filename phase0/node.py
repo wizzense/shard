@@ -4,8 +4,8 @@ head node: tokenizer + embedding + layers[0:split], runs the generation loop, sa
 tail node: layers[split:] + final norm + lm_head, serves activations -> next token.
 
 no kv-cache yet (recompute the full sequence each step). the point of phase 0 is to
-prove a split model serves coherent tokens reliably through a transport we own, the
-exact thing nothing off-the-shelf could do. kv-cache + sglang + spec-decode come next.
+prove a split model serves coherent tokens reliably through a transport we own —
+the exact thing nothing off-the-shelf could do. kv-cache + sglang + spec-decode come next.
 
 run tail first:
   python node.py --role tail  --split 18 --port 29501
