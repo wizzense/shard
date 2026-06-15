@@ -42,6 +42,8 @@ def serve_tail(parts, port, timeout, dev):
                     elif op == "crop":
                         cache.crop(msg["len"]); send_msg(conn, "ok")
                     elif op == "verify":
+                        if msg.get("crop") is not None:    # roll back the prior round's rejected tokens
+                            cache.crop(msg["crop"])
                         h = run_layers(msg["h"].to(dev), parts, cache, msg["start"])
                         h = parts["norm"](h)
                         toks = parts["lm_head"](h).argmax(-1)[0].tolist()
@@ -89,6 +91,7 @@ def generate(draft, thead, tok, sock, prompt, K, max_new, dev, timeout,
         out = [cur]
         rounds, accepted_total = 0, 0
         kc, ema_n, k_hist = K, float(K), []        # kc = current K (adapts if enabled)
+        tail_crop = None                           # lazy tail rollback, piggybacked on the next verify
         t0 = time.time()
         with torch.no_grad():
             while len(out) < max_new and cur != eos:
@@ -100,9 +103,9 @@ def generate(draft, thead, tok, sock, prompt, K, max_new, dev, timeout,
                     dtok = int(dl[0, -1].argmax())
                     if i < kc:
                         drafts.append(dtok)
-                # 2. verify [cur, d_1..d_kc] in one traversal
+                # 2. verify [cur, d_1..d_kc] in one traversal (carry the prior round's tail rollback)
                 h = embed([cur] + drafts)
-                r = _rpc(sock, {"op": "verify", "h": h.cpu(), "start": pos})   # [r_1..r_{kc+1}]
+                r = _rpc(sock, {"op": "verify", "h": h.cpu(), "start": pos, "crop": tail_crop})
                 # 3. greedy acceptance: longest prefix with d_j == r_j
                 n = 0
                 for j in range(kc):
@@ -115,9 +118,10 @@ def generate(draft, thead, tok, sock, prompt, K, max_new, dev, timeout,
                 cur = r[n]
                 pos += n + 1
                 rounds += 1; accepted_total += n; k_hist.append(kc)
-                # 4. roll every cache back to the accepted length
+                # 4. roll caches back to the accepted length: head's locally now (no round-trip),
+                #    the tail's lazily on the next verify (piggybacked, no extra WAN trip)
                 thead_cache.crop(pos); draft_cache.crop(pos)
-                _rpc(sock, {"op": "crop", "len": pos})
+                tail_crop = pos
                 # 5. adaptive K: aim a couple beyond the running acceptance (EMA of n)
                 ema_n = 0.7 * ema_n + 0.3 * n
                 if adaptive:
