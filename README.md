@@ -32,8 +32,25 @@ serves reliably. That is the point of the milestone — a model too big for one
 GPU, running across several.
 
 Not done yet, stated plainly: the two nodes are co-located on a low-latency link
-(not real WAN/NAT), and there is no speculative decoding. Both are next — see
-[docs/ROADMAP.md](docs/ROADMAP.md).
+(not real WAN/NAT) — making the transport survive the real internet is Phase 1.
+See [docs/ROADMAP.md](docs/ROADMAP.md).
+
+## Speculative decoding (Phase 2, prototype)
+
+A small draft model runs locally on the entry node and proposes K tokens; the
+split target verifies all K in a single pipeline traversal. Greedy acceptance,
+so the output is exact — token-for-token identical to plain decode.
+
+Measured on the 2-node 14B split (co-located, K=6):
+
+| Draft | Workload | Accepted / round | Tokens per traversal |
+|-------|----------|------------------|----------------------|
+| 1.5B  | prose    | 2.3 / 6          | 3.3×                 |
+| 0.5B  | code     | 5.1 / 6          | 6.0×                 |
+
+Acceptance is independent of the link, so this ratio carries directly to the WAN
+round-trip count — where plain decode is latency-bound at 1–2 tok/s, cutting
+traversals-per-token 3–6× is the difference between unusable and usable.
 
 ## How it works
 
