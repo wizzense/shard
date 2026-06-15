@@ -31,8 +31,9 @@ The 14B model does not fit on a single 24 GB card in bf16; split across two, it
 serves reliably. That is the point of the milestone — a model too big for one
 GPU, running across several.
 
-Not done yet, stated plainly: the two nodes are co-located on a low-latency link
-(not real WAN/NAT) — making the transport survive the real internet is Phase 1.
+Not done yet, stated plainly: the Phase 0 figures above are co-located; the WAN
+numbers below run over a direct open port between hosts. NAT hole-punching and a
+relay fallback (for nodes behind home routers) are the remaining Phase 1 work.
 See [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Speculative decoding (Phase 2, prototype)
@@ -48,9 +49,19 @@ Measured on the 2-node 14B split (co-located, K=6):
 | 1.5B  | prose    | 2.3 / 6          | 3.3×                 |
 | 0.5B  | code     | 5.1 / 6          | 6.0×                 |
 
-Acceptance is independent of the link, so this ratio carries directly to the WAN
-round-trip count — where plain decode is latency-bound at 1–2 tok/s, cutting
-traversals-per-token 3–6× is the difference between unusable and usable.
+Acceptance is independent of the link, so the traversal count carries straight to
+WAN. Over a real transatlantic link (Norway head → North Carolina tail, ~115 ms
+RTT, Qwen2.5-3B split 18/18, 0.5B draft, adaptive K):
+
+| Workload | Plain decode | Spec-decode | Speedup |
+|----------|--------------|-------------|---------|
+| Code     | 6.0 tok/s    | 20.5 tok/s  | 3.4×    |
+| Prose    | 5.9 tok/s    | 9.7 tok/s   | 1.6×    |
+
+Plain decode is latency-bound — one round-trip per token (~133 ms/step measured).
+A spec-decode round costs one round-trip too but commits several tokens, turning a
+latency-bound 6 tok/s into 20 on code: the difference between unusable and usable
+over the open internet.
 
 ## How it works
 

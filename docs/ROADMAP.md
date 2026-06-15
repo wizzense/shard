@@ -25,6 +25,8 @@ This was the thing that blocked us all day. It's the momentum milestone.
 - Add edge supervision: kill a node mid-stream, confirm the pipeline detects it and the request fails cleanly (not a hang).
 - **Pass = reliable WAN serving + an honest WAN tok/s number** (will be latency-bound and slow, that's the point, it sets the baseline spec-decode has to beat).
 
+**◑ PARTIAL (2026-06-15).** Reliable WAN serving demonstrated over a real transatlantic link: Norway head → North Carolina tail (~115ms RTT), 2-node Qwen2.5-3B split moving activations over our own TCP transport via a direct open port. Honest WAN tok/s: plain decode **6.0 tok/s** (latency-bound, ~133ms/token round-trip) → speculative decoding **20.5 tok/s on code (3.4×)**, 9.7 on prose (1.6×) — the multiplier cashing out over real internet. Edge supervision (timeouts/fail-fast) carried from Phase 0 hardening. Remaining: NAT hole-punching + relay fallback (a direct open port stands in for now), and fp8/int8 activation quantization.
+
 ## Phase 2 — speculative decoding (target: ~1 week)
 
 The payoff. Add the draft-verify loop.
