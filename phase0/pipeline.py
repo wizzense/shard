@@ -24,30 +24,40 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 from node_kv import run_layers, send_msg, recv_msg, EDGE_ERRORS, TransportError
 
 
-def load_stage(model_id, stage, nstages, device="cuda", dtype=torch.bfloat16):
-    """load only this stage's contiguous block of layers (+ embed on the head,
-    norm/lm_head on the tail). layer_idx is reindexed 0-based for the per-node cache."""
-    print(f"[s{stage}] loading {model_id} ...", flush=True)
-    model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype, attn_implementation="eager")
-    m = model.model
-    n_layers = len(m.layers)
+def load_stage(model_id, stage, nstages, device="cuda", dtype="auto"):
+    """load ONLY this stage's contiguous block of layers onto the GPU (+ embed on
+    the head, norm/lm_head on the tail). every other component is mapped to "meta"
+    so it is never loaded -- this is what lets a node hold a slice of a model far
+    too big for its card (a 57GB 120B over 4 nodes = ~14GB each). layer_idx is
+    reindexed 0-based for the per-node cache. dtype="auto" preserves a checkpoint's
+    own precision (e.g. gpt-oss mxfp4) instead of upcasting it."""
+    from transformers import AutoConfig
+    cfg = AutoConfig.from_pretrained(model_id)
+    n_layers = cfg.num_hidden_layers
     lo = stage * n_layers // nstages
     hi = (stage + 1) * n_layers // nstages
-    parts = {"rotary": m.rotary_emb, "n_layers": n_layers, "lo": lo, "hi": hi}
-    if stage == 0:
+    is_head, is_tail = stage == 0, stage == nstages - 1
+    tied = bool(getattr(cfg, "tie_word_embeddings", False))   # then lm_head shares embed's weight
+    dmap = {"model.embed_tokens": device if (is_head or (is_tail and tied)) else "meta",
+            "model.rotary_emb": device,
+            "model.norm": device if is_tail else "meta",
+            "lm_head": device if is_tail else "meta"}
+    for j in range(n_layers):
+        dmap[f"model.layers.{j}"] = device if lo <= j < hi else "meta"
+    print(f"[s{stage}] loading layers [{lo}:{hi}] of {model_id} ...", flush=True)
+    model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype, device_map=dmap,
+                                                 attn_implementation="eager")
+    m = model.model
+    parts = {"rotary": m.rotary_emb, "n_layers": n_layers, "lo": lo, "hi": hi, "_model": model}
+    if is_head:
         parts["embed"] = m.embed_tokens
-    if stage == nstages - 1:
+    if is_tail:
         parts["norm"] = m.norm
         parts["lm_head"] = model.lm_head
     kept = [m.layers[i] for i in range(lo, hi)]
     for i, layer in enumerate(kept):
         layer.self_attn.layer_idx = i
     parts["layers"] = torch.nn.ModuleList(kept)
-    for key in ("embed", "layers", "norm", "lm_head", "rotary"):
-        if isinstance(parts.get(key), torch.nn.Module):
-            parts[key] = parts[key].to(device)
-    del model, m
-    import gc; gc.collect(); torch.cuda.empty_cache()
     print(f"[s{stage}] loaded layers [{lo}:{hi}] ({hi-lo}/{n_layers}), "
           f"gpu_mem={torch.cuda.memory_allocated(device)/1e9:.1f}GB", flush=True)
     return parts
