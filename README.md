@@ -129,3 +129,7 @@ Full detail, pass/fail criteria, and risks: [docs/ROADMAP.md](docs/ROADMAP.md).
     phase0/   Working two-node split inference — node.py, node_kv.py, bench.py
     shard/    Engine modules — node, transport, specdec, scheduler (scaffolding)
     docs/     ARCHITECTURE, ROADMAP
+
+## License
+
+[Apache License 2.0](LICENSE) © 2026 leyten
