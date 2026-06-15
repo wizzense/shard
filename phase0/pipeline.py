@@ -1,0 +1,165 @@
+"""shard: N-node pipeline-parallel inference (generalizes node_kv.py past 2 stages).
+
+a model's layers are split into N contiguous blocks, one per node. activations
+flow forward stage 0 -> 1 -> ... -> N-1; the last stage samples and the token
+bubbles back along the same chain to stage 0, which drives generation. each node
+keeps a per-node KV-cache (layer_idx reindexed 0-based within its block).
+
+stage i (0 = head/driver, N-1 = tail) holds layers [i*L/N : (i+1)*L/N]; the head
+also holds the embedding, the tail the final norm + lm_head. every node holds the
+rotary module (needed to build position embeddings for its block).
+
+launch tail-first so each node connects to an already-listening successor:
+  # tail (stage N-1): listens for stage N-2
+  python pipeline.py --stage 3 --nstages 4 --model M --listen-port 29501
+  # middle (stage i): connects forward to stage i+1, listens for stage i-1
+  python pipeline.py --stage 1 --nstages 4 --model M --listen-port 29501 --next HOST2:29501
+  # head (stage 0): connects forward to stage 1, drives generation
+  python pipeline.py --stage 0 --nstages 4 --model M --next HOST1:29501 --prompt "..."
+"""
+
+import argparse, socket, time
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
+from node_kv import run_layers, send_msg, recv_msg, EDGE_ERRORS, TransportError
+
+
+def load_stage(model_id, stage, nstages, device="cuda", dtype=torch.bfloat16):
+    """load only this stage's contiguous block of layers (+ embed on the head,
+    norm/lm_head on the tail). layer_idx is reindexed 0-based for the per-node cache."""
+    print(f"[s{stage}] loading {model_id} ...", flush=True)
+    model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype, attn_implementation="eager")
+    m = model.model
+    n_layers = len(m.layers)
+    lo = stage * n_layers // nstages
+    hi = (stage + 1) * n_layers // nstages
+    parts = {"rotary": m.rotary_emb, "n_layers": n_layers, "lo": lo, "hi": hi}
+    if stage == 0:
+        parts["embed"] = m.embed_tokens
+    if stage == nstages - 1:
+        parts["norm"] = m.norm
+        parts["lm_head"] = model.lm_head
+    kept = [m.layers[i] for i in range(lo, hi)]
+    for i, layer in enumerate(kept):
+        layer.self_attn.layer_idx = i
+    parts["layers"] = torch.nn.ModuleList(kept)
+    for key in ("embed", "layers", "norm", "lm_head", "rotary"):
+        if isinstance(parts.get(key), torch.nn.Module):
+            parts[key] = parts[key].to(device)
+    del model, m
+    import gc; gc.collect(); torch.cuda.empty_cache()
+    print(f"[s{stage}] loaded layers [{lo}:{hi}] ({hi-lo}/{n_layers}), "
+          f"gpu_mem={torch.cuda.memory_allocated(device)/1e9:.1f}GB", flush=True)
+    return parts
+
+
+def serve(parts, stage, nstages, listen_port, nxt, timeout, dev):
+    """a non-head stage: recv activations from the predecessor, run this block,
+    forward to the successor (or sample if tail), then bubble the token back."""
+    is_tail = stage == nstages - 1
+    nxt_sock = None
+    if not is_tail:
+        host, port = nxt.split(":")
+        nxt_sock = socket.socket(); nxt_sock.settimeout(timeout); nxt_sock.connect((host, int(port)))
+        print(f"[s{stage}] connected forward to stage {stage+1} at {nxt}", flush=True)
+    srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", listen_port)); srv.listen(1)
+    print(f"[s{stage}] listening on :{listen_port} (edge timeout {timeout:.0f}s)", flush=True)
+    while True:
+        conn, addr = srv.accept(); conn.settimeout(timeout)
+        print(f"[s{stage}] stage {stage-1} connected from {addr}", flush=True)
+        cache = DynamicCache(); steps = 0
+        with torch.no_grad():
+            while True:
+                try:
+                    msg = recv_msg(conn)
+                    if msg["op"] == "reset":
+                        cache = DynamicCache()
+                        if nxt_sock: send_msg(nxt_sock, msg); recv_msg(nxt_sock)
+                        send_msg(conn, "ok"); continue
+                    h = run_layers(msg["h"].to(dev), parts, cache, msg["start"])
+                    if is_tail:
+                        h = parts["norm"](h)
+                        tok = int(parts["lm_head"](h[:, -1, :]).argmax(-1).item())
+                    else:                                  # forward, get the token back
+                        send_msg(nxt_sock, {"op": "fwd", "h": h.cpu(), "start": msg["start"]})
+                        tok = recv_msg(nxt_sock)
+                    send_msg(conn, tok); steps += 1
+                except EDGE_ERRORS as e:
+                    why = "stalled" if isinstance(e, socket.timeout) else "closed"
+                    print(f"[s{stage}] edge {why} after {steps} steps ({type(e).__name__}); resetting", flush=True)
+                    try: conn.close()
+                    except OSError: pass
+                    break
+
+
+def drive(parts, tok, nxt, prompt, max_new, dev, timeout):
+    """stage 0: embed, run the first block, push activations down the pipe, read
+    the sampled token back, repeat. one generation per connection."""
+    host, port = nxt.split(":")
+    sock = socket.socket(); sock.settimeout(timeout); sock.connect((host, int(port)))
+    print(f"[s0] connected forward to stage 1 at {nxt}; generating ...", flush=True)
+    eos = tok.eos_token_id
+    enc = tok.apply_chat_template([{"role": "user", "content": prompt}],
+                                  add_generation_prompt=True, return_tensors="pt", return_dict=True)
+    ids = enc["input_ids"].to(dev)
+    cache = DynamicCache()
+    out, start, t0, t_prefill = [], 0, time.time(), None
+
+    def step(token_ids, start):
+        h = run_layers(parts["embed"](token_ids), parts, cache, start)
+        send_msg(sock, {"op": "fwd", "h": h.cpu(), "start": start})
+        return recv_msg(sock)
+
+    try:
+        send_msg(sock, {"op": "reset"}); recv_msg(sock)
+        with torch.no_grad():
+            nxt_tok = step(ids, start)
+            t_prefill = time.time()
+            start += ids.shape[1]; out.append(nxt_tok)
+            for _ in range(max_new - 1):
+                if nxt_tok == eos:
+                    out.pop(); break
+                nxt_tok = step(torch.tensor([[nxt_tok]], device=dev), start)
+                start += 1; out.append(nxt_tok)
+    except EDGE_ERRORS as e:
+        raise TransportError(f"pipeline edge failed at token {len(out)} ({type(e).__name__}: {e})") from e
+    finally:
+        sock.close()
+    if out and out[-1] == eos:
+        out.pop()
+    dec = time.time() - t_prefill if t_prefill else 0.0
+    return {"text": tok.decode(out, skip_special_tokens=True), "n_tokens": len(out),
+            "prefill_s": (t_prefill - t0) if t_prefill else 0.0,
+            "tok_s": len(out) / max(dec, 1e-9), "total_s": time.time() - t0}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--stage", type=int, required=True)
+    ap.add_argument("--nstages", type=int, required=True)
+    ap.add_argument("--model", default="Qwen/Qwen2.5-3B-Instruct")
+    ap.add_argument("--listen-port", type=int, default=29501)
+    ap.add_argument("--next", default="")              # host:port of stage+1 (non-tail nodes)
+    ap.add_argument("--prompt", default="Explain decentralized computing in two sentences.")
+    ap.add_argument("--max-new", type=int, default=64)
+    ap.add_argument("--timeout", type=float, default=30.0)
+    args = ap.parse_args()
+    dev = "cuda"
+    parts = load_stage(args.model, args.stage, args.nstages, device=dev)
+
+    if args.stage == 0:
+        tok = AutoTokenizer.from_pretrained(args.model)
+        try:
+            r = drive(parts, tok, args.next, args.prompt, args.max_new, dev, args.timeout)
+        except TransportError as e:
+            print(f"\n[s0] TRANSPORT FAILURE: {e}", flush=True); raise SystemExit(2)
+        print(f"\n[s0] === OUTPUT ===\n{r['text']}\n", flush=True)
+        print(f"[s0] {r['n_tokens']} tokens, total {r['total_s']:.1f}s | prefill {r['prefill_s']:.2f}s | "
+              f"decode {r['tok_s']:.2f} tok/s ({args.nstages}-stage pipeline)", flush=True)
+    else:
+        serve(parts, args.stage, args.nstages, args.listen_port, args.next, args.timeout, dev)
+
+
+if __name__ == "__main__":
+    main()
