@@ -7,198 +7,127 @@ order. No datacenter, no single host, and no node ever holds the whole model.
 
 Shard is the inference engine for [c0mpute](https://c0mpute.ai).
 
-## 100B+ across the swarm
+## gpt-oss-120B across four consumer GPUs, over the open internet
 
-**gpt-oss-120b — 120 billion parameters — served across the swarm.** Split 9
-layers per node across 4× RTX 4090 (~16 GB each, ~64 GB total); no single 24 GB
-card can hold it, four can. Each node loads **only its own block** — the rest of
-the model is never materialized on that node.
+**120 billion parameters, served at ~18–25 tok/s across four RTX 4090s in
+different US states — over WAN, output exact.** The model is split 9 layers per
+node across 4× RTX 4090 (~16 GB each); no single 24 GB card holds it, four do.
+Each node loads **only its own block** — the rest of the model is never
+materialized on it. A small in-house draft proposes tokens and the distributed
+120B verifies them in one traversal of the chain.
 
-| Setup | Result |
-|-------|--------|
-| 4 nodes, co-located | coherent output, 6.3 tok/s |
-| **4 nodes, 2 machines, ~95 ms WAN** (Washington ↔ Quebec) | **coherent output, 3.5 tok/s** |
+| Setup | tok/s (warm) | Output |
+|-------|--------------|--------|
+| 120B, 4× RTX 4090 across 3 US sites (Kansas ×2 · Illinois · N. Carolina), WAN, spec-decode + fast verify | **18.5 – 24.8** (prompt-dependent) | exact greedy decode |
 
-That second row is the whole thesis in one line: a frontier-size model, far too
-big for any consumer GPU, served across machines on different networks over the
-open internet — the activations physically crossing the continent on every token.
-Plain decode is latency-bound; speculative decoding now layers on **at this 120B
-scale** to push it past the plain baseline — exact output, measured over a real
-transatlantic link. See [Speculative decoding](#speculative-decoding-phase-2).
+That is the whole thesis in one line: a frontier-size model, far too big for any
+consumer GPU, served across machines on different networks — activations crossing
+the country on every traversal — at a speed that is actually usable.
 
-## Status
+## How it got there
 
-**Phase 0 complete** — a two-node split serving tokens with a per-node KV-cache,
-over a transport we control.
+Plain pipeline decode over WAN is latency-bound: one round-trip per token, ~1–6
+tok/s, unusable. The path to 25 was a sequence of measured steps, each recorded in
+the [research log](docs/research/wan-speculative-decoding.md):
 
-The figures below are an early milestone. They show that the split-and-stream
-mechanism is correct and reliable on co-located hardware; they are **not** a
-final performance spec. Throughput and latency will change as WAN transport
-(Phase 1) and speculative decoding (Phase 2) land.
+| Step | tok/s (120B, WAN) | What changed |
+|------|-------------------|--------------|
+| plain decode | ~3–5 | latency-bound baseline |
+| + speculative decoding (in-house 20B draft) | 13.3 | one traversal commits several tokens |
+| + coordinator + clustered US + direct return | 7.83\* | real 4-scattered-GPU topology, tail returns to the entry node in one hop |
+| **+ fast verify (static-cache CUDA graph)** | **18.6 → 24.8** | the verify compute, not the WAN, was the wall |
 
-**Phase 0 — 2× RTX 4090, co-located, low-latency link:**
+\*the 7.83 is the harder 4-separate-box topology that the fast verify then lifts to ~19–25.
 
-| Metric      | Result                                                            |
-|-------------|-------------------------------------------------------------------|
-| Model       | Qwen2.5-14B-Instruct — bf16, 29.5 GB (exceeds a single 24 GB 4090) |
-| Split       | 24 / 24 layers across two GPUs (~14.8 GB each)                    |
-| Reliability | 20 / 20 clean completions                                         |
-| Throughput  | ~16 tok/s decode (median 16.2)                                    |
-| Transport   | Custom TCP — per-edge timeouts, fault detection, instrumented     |
+**The key insight: over WAN the round-trip is the scarce resource, not compute** —
+so speculative decoding, marginal in a datacenter, becomes the whole game. A small
+draft proposes K tokens; the distributed 120B verifies all K in a single pipeline
+traversal (the same round-trip plain decode spends on one token); greedy acceptance
+keeps the output **token-for-token identical to plain decode**.
 
-The 14B model does not fit on a single 24 GB card in bf16; split across two, it
-serves reliably. That is the point of the milestone — a model too big for one
-GPU, running across several.
+Two non-obvious results made it fast:
 
-Not done yet, stated plainly: the Phase 0 figures above are co-located; the WAN
-numbers below run over a direct open port between hosts. NAT hole-punching and a
-relay fallback (for nodes behind home routers) are the remaining Phase 1 work.
-See [docs/ROADMAP.md](docs/ROADMAP.md).
+- **In-house draft (no training).** gpt-oss-20B under vLLM on one 4090 drafts at
+  ~5 ms/tok vs 62 ms in plain transformers — a 12× cheaper draft from optimized
+  MXFP4 kernels + CUDA graphs, no training. It runs on the entry node; it holds no
+  authority (the target verifies every token), so centralizing it is safe.
 
-## Speculative decoding (Phase 2, prototype)
-
-A small draft model runs locally on the entry node and proposes K tokens; the
-split target verifies all K in a single pipeline traversal. Greedy acceptance,
-so the output is exact — token-for-token identical to plain decode.
-
-Measured on the 2-node 14B split (co-located, K=6):
-
-| Draft | Workload | Accepted / round | Tokens per traversal |
-|-------|----------|------------------|----------------------|
-| 1.5B  | prose    | 2.3 / 6          | 3.3×                 |
-| 0.5B  | code     | 5.1 / 6          | 6.0×                 |
-
-Acceptance is independent of the link, so the traversal count carries straight to
-WAN. Over a real transatlantic link (Norway head → North Carolina tail, ~115 ms
-RTT, Qwen2.5-3B split 18/18, 0.5B draft, adaptive K):
-
-| Workload | Plain decode | Spec-decode | Speedup |
-|----------|--------------|-------------|---------|
-| Code     | 6.0 tok/s    | 20.5 tok/s  | 3.4×    |
-| Prose    | 5.9 tok/s    | 9.7 tok/s   | 1.6×    |
-
-Plain decode is latency-bound — one round-trip per token (~133 ms/step measured).
-A spec-decode round costs one round-trip too but commits several tokens, turning a
-latency-bound 6 tok/s into 20 on code: the difference between unusable and usable
-over the open internet.
-
-### At 120B scale, over WAN
-
-The same draft-and-verify, now on the full **gpt-oss-120b split across four nodes
-on two machines** (Sweden ↔ North Carolina, a real transatlantic hop). The draft
-is gpt-oss-20b on its own GPU at the entry node — the smallest model that shares
-the 120b tokenizer, which exact greedy acceptance requires. Warm, steady-state:
-
-| Setup | Plain decode | Spec-decode (K=4) | Speedup |
-|-------|--------------|-------------------|---------|
-| 4-stage 120b, 2 machines, transatlantic WAN | 4.67 tok/s | 6.5 tok/s | 1.4× |
-
-The draft predicts the 120b **2.5 tokens ahead per round** (3.5 committed per
-traversal), output exact. The multiplier is smaller than the 3B case above because
-the draft is heavier relative to the target: gpt-oss ships no model below 20b, and
-that 20b decodes at ~62 ms/token, eating part of the round-trip it saves. The gain
-scales with WAN latency and inversely with draft cost — a lighter tokenizer-matched
-draft, or a higher-latency link (real home connections), widens it.
-
-Two findings worth recording: gpt-oss's MXFP4 kernels JIT-compile on first use, so
-the warm steady-state is the honest number (a cold first run reads ~30 % slow); and
-a **fixed K beats adaptive K** here, because each change in K recompiles kernels for
-a new sequence-length shape — the recompiles cost more than the adaptivity saves.
+- **Fast verify (static-cache CUDA graph).** The eager verify was ~75% removable
+  Python / kernel-launch overhead. Capturing a 120B stage's forward as a CUDA
+  graph against a pre-allocated static KV cache makes it **bit-exact and ~5×
+  faster** — cutting the clustered verify from 372 ms to ~135 ms (warm) and taking
+  the 4-separate-GPU topology from 7.83 to **24.8 tok/s**, past this track's 20
+  tok/s success criterion. (`phase0/fastverify.py`, `research/fastverify_graph.py`.)
 
 ## How it works
 
-A transformer is a stack of layers. Shard splits the stack into contiguous
-blocks and places one block on each GPU. A token is produced by passing
-activations through the blocks in order:
+A transformer is a stack of layers. Shard splits the stack into contiguous blocks,
+one block per GPU. A token is produced by passing activations through the blocks in
+order; each node keeps a KV-cache for its own layers.
 
-    Prompt ─► embed ─► Node 0             Node 1 ─► sample ─► token
-                       layers 0–23  ────►  layers 24–47
-                       RTX 4090            RTX 4090
+    coordinator ──► draft (20B, proposes K)
+         │
+         └─► stage 0 ──► stage 1 ──► stage 2 ──► stage 3 ──┐  (verify K+1 in one traversal)
+             KS           KS          IL          NC        │
+             ▲────────────── direct return ─────────────────┘
 
-Each node holds only its block in VRAM, runs that block's forward pass, and ships
-the resulting hidden-state tensor to the next node. Each node keeps a KV-cache
-for its own layers, so the prompt is processed once and decoding sends only the
-new token's activations downstream.
+The coordinator (entry node) holds **no** 120B layers — only the draft and a thin
+driver. Each round: the draft proposes K tokens; the coordinator sends `[cur, d₁..dₖ]`
+into stage 0, which embeds them; the chain verifies all K+1 in one forward traversal;
+the tail returns the argmaxes straight to the coordinator (one hop, not relayed back);
+the coordinator greedy-accepts the longest matching prefix. The verify forward on each
+stage replays a captured CUDA graph against a static KV cache — the fast verify.
 
 ## Why this is hard
 
-Splitting a model across co-located GPUs is well understood. Doing it across
-machines on the open internet, fast enough to be usable, is not — and that is the
-part Shard is built to own.
+Splitting a model across co-located GPUs is well understood. Doing it across machines
+on the open internet, fast enough to be usable, is not — and that is the part Shard
+owns.
 
-**Latency.** Decoding is one token at a time, and every token traverses the whole
-pipeline. With nodes on home connections at 50–80 ms per hop, a multi-stage
-pipeline costs hundreds of milliseconds per token — 1–2 tok/s, unusable. Shard's
-answer is speculative decoding over the swarm: a small draft model on the entry
-node proposes several tokens, and the large split model verifies them in a single
-pass through the pipeline, amortizing one round trip over many tokens. (Phase 2.)
-
-**Transport.** The activation tensor crosses the public internet between machines
-behind NAT on every step. It has to be fast, reliable, and able to reconnect when
-a home connection drops. Shard owns this layer instead of treating it as a black
-box: direct QUIC between adjacent stages with hole-punching, a relay fallback for
-symmetric NAT, quantized activations to cut bandwidth, and supervised edges that
-fail fast and reconnect. Every edge logs its own health — there is no opaque
-"broken pipe." (Phase 1.)
+- **Latency.** Every token traverses the whole pipeline. Speculative decoding amortizes
+  one round-trip over many committed tokens; the fast verify keeps the traversal cheap
+  enough that the WAN, not the compute, sets the floor.
+- **Transport.** The activation tensor crosses the public internet on every step. Shard
+  owns this layer — supervised edges that fail fast and reconnect, per-edge health
+  logging, no opaque "broken pipe." (NAT hole-punching + relay fallback for home routers
+  is the remaining Phase 1 work; a direct open port stands in today.)
 
 ## Design principles
 
-Shard is c0mpute infrastructure, and is held to its three guarantees:
+Shard is c0mpute infrastructure, held to its three guarantees:
 
-- **Uncensored.** The engine runs models as-is. No content filter in the
-  inference path.
-- **Decentralized.** Anyone can join a GPU with one command and be assigned a
-  block of layers. The scheduler is light and replaceable; there is no central
-  inference server.
-- **Private.** No node holds the whole model — a real start, but not the whole
-  story. Intermediate activations can still leak a meaningful fraction of a
-  user's tokens to a malicious node in the pipeline. Shard's plan — pin the leaky
-  boundary layers to trusted nodes, offer per-request trusted routing, and never
-  overclaim — is detailed in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). This
-  is the number-one open problem, and it is treated as one.
-
-## Running Phase 0
-
-Two machines, each with a CUDA GPU, plus Python, `torch`, and `transformers`.
-Weights download from Hugging Face on first run.
-
-On the tail node (holds the second half of the layers):
-
-    python phase0/node_kv.py --role tail --split 24 --port 29501 \
-        --model Qwen/Qwen2.5-14B-Instruct
-
-On the head node (holds the embedding and first half, and drives generation):
-
-    python phase0/node_kv.py --role head --split 24 --port 29501 \
-        --peer <TAIL_IP> --model Qwen/Qwen2.5-14B-Instruct \
-        --prompt "Explain pipeline parallelism in two sentences."
-
-To reproduce the reliability numbers above:
-
-    python phase0/bench.py --split 24 --port 29501 --peer <TAIL_IP> \
-        --runs 20 --model Qwen/Qwen2.5-14B-Instruct
-
-For a quick smoke test on a smaller model, drop `--model` (defaults to
-Qwen2.5-3B-Instruct) and use `--split 18`.
-
-## Roadmap
-
-- **Phase 0 — Transport, proven (done).** Reliable serving through a two-node
-  split on a low-latency link.
-- **Phase 1 — WAN.** The same split across machines on different networks behind
-  NAT: hole-punching, relay fallback, activation quantization, edge supervision.
-- **Phase 2 — Speculative decoding.** Draft-and-verify over the swarm, to make
-  WAN latency survivable.
-- **Phase 3 — Permissionless swarm.** One-command join, dynamic layer allocation
-  across heterogeneous GPUs, per-token payouts.
-
-Full detail, pass/fail criteria, and risks: [docs/ROADMAP.md](docs/ROADMAP.md).
+- **Uncensored.** The engine runs models as-is. No content filter in the inference path.
+- **Decentralized.** Anyone can join a GPU with one command and be assigned a block of
+  layers. No central inference server.
+- **Private.** No node holds the whole model — a real start, not the whole story.
+  Intermediate activations can still leak a fraction of a user's tokens to a malicious
+  node. The plan — pin leaky boundary layers to trusted nodes, per-request trusted
+  routing, never overclaim — is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). It is
+  the number-one open problem and is treated as one.
 
 ## Repository layout
 
-    phase0/   Working two-node split inference — node.py, node_kv.py, bench.py
-    shard/    Engine modules — node, transport, specdec, scheduler (scaffolding)
-    docs/     ARCHITECTURE, ROADMAP
+    phase0/   the working engine — node_kv.py (2-node split), pipeline.py (N-stage),
+              specpipe.py (speculative decoding over the split), fastverify.py
+              (static-cache CUDA-graph verify), tree.py (tree speculation), bench.py
+    research/ the WAN spec-decode experiments — draft_server.py (in-house vLLM draft),
+              fastverify_*.py (the de-risking probes), launch scripts
+    docs/     ARCHITECTURE, ROADMAP, and research/wan-speculative-decoding.md (the
+              full design record + measured milestone log)
+    shard/    engine module scaffolding (node, transport, specdec, scheduler)
+
+## Roadmap
+
+- **Phase 0 — Transport, proven.** Reliable serving through a multi-stage split.
+- **Phase 1 — WAN.** Different networks behind NAT: hole-punching, relay fallback,
+  activation quantization, edge supervision.
+- **Phase 2 — Speculative decoding.** Draft-and-verify over the swarm — **done at
+  120B scale, ~18–25 tok/s exact over WAN** (see above).
+- **Phase 3 — Permissionless swarm.** One-command join, dynamic layer allocation
+  across heterogeneous GPUs, per-token payouts, fault tolerance.
+
+Full detail, pass/fail criteria, and risks: [docs/ROADMAP.md](docs/ROADMAP.md).
+The WAN speculative-decoding design record: [docs/research/wan-speculative-decoding.md](docs/research/wan-speculative-decoding.md).
 
 ## License
 
