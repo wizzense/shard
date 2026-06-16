@@ -60,7 +60,11 @@ def serve_spec(parts, stage, nstages, listen_port, nxt, timeout, dev):
                         send_msg(conn, "ok"); continue
                     if msg.get("crop") is not None:        # roll back the prior round's rejects
                         cache.crop(msg["crop"])
-                    h = run_block(msg["h"].to(dev), parts, cache, msg["start"])
+                    if "token_ids" in msg:                 # served head: coordinator sent token ids, embed here
+                        x = parts["embed"](torch.tensor([msg["token_ids"]], device=dev))
+                        h = run_block(x, parts, cache, msg["start"])
+                    else:
+                        h = run_block(msg["h"].to(dev), parts, cache, msg["start"])
                     if is_tail:
                         h = parts["norm"](h)
                         toks = parts["lm_head"](h).argmax(-1)[0].tolist()
@@ -178,10 +182,72 @@ def generate_spec(draft, parts, tok, sock, prompt, K, max_new, dev, draft_dev, t
     }
 
 
+def coordinate(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout,
+               adaptive=False, k_min=1, k_max=12):
+    """the in-house coordinator (c0mpute entry node): holds NO 120B layers. it
+    tokenizes, queries the in-house draft for K tokens, sends token ids into the
+    swarm's stage 0 (which embeds + runs), reads back the verify, greedy-accepts.
+    the whole 120B lives on the scattered swarm nodes; this node is just the entry
+    point plus the managed draft. lazy crop propagates to every swarm node."""
+    pipe_sock.settimeout(timeout)
+    eos = tok.eos_token_id
+    enc = tok.apply_chat_template([{"role": "user", "content": prompt}],
+                                  add_generation_prompt=True, return_tensors="pt", return_dict=True)
+    prompt_ids = enc["input_ids"][0].tolist()
+    out = []
+    try:
+        send_msg(pipe_sock, {"op": "reset"}); recv_msg(pipe_sock)
+        send_msg(pipe_sock, {"op": "verify", "token_ids": prompt_ids, "start": 0})   # prefill
+        cur = recv_msg(pipe_sock)[-1]
+        pos = len(prompt_ids)
+        out = [cur]
+        rounds, accepted_total = 0, 0
+        kc, ema_n, k_hist = K, float(K), []
+        tail_crop = None
+        t_draft = t_verify = 0.0
+        t0 = time.time()
+        while len(out) < max_new and cur != eos:
+            td = time.time()
+            send_msg(draft_sock, {"ids": prompt_ids + out, "k": kc}); drafts = recv_msg(draft_sock)
+            t_draft += time.time() - td
+            tv = time.time()
+            send_msg(pipe_sock, {"op": "verify", "token_ids": [cur] + drafts, "start": pos, "crop": tail_crop})
+            r = recv_msg(pipe_sock)
+            t_verify += time.time() - tv
+            n = 0
+            for j in range(kc):
+                if drafts[j] == r[j]: n += 1
+                else: break
+            committed = drafts[:n] + [r[n]]
+            out.extend(committed); cur = r[n]; pos += n + 1
+            rounds += 1; accepted_total += n; k_hist.append(kc); tail_crop = pos
+            ema_n = 0.7 * ema_n + 0.3 * n
+            if adaptive:
+                kc = max(k_min, min(k_max, round(ema_n) + 2))
+            if eos in committed:
+                break
+    except EDGE_ERRORS as e:
+        raise TransportError(f"pipeline edge failed at token {len(out)} ({type(e).__name__}: {e})") from e
+    dt = time.time() - t0
+    if eos in out:
+        out = out[:out.index(eos)]
+    return {
+        "text": tok.decode(out, skip_special_tokens=True), "n_tokens": len(out), "rounds": rounds,
+        "mean_accept": accepted_total / max(rounds, 1),
+        "toks_per_traversal": (accepted_total + rounds) / max(rounds, 1),
+        "tok_s": len(out) / max(dt, 1e-9),
+        "mean_K": (sum(k_hist) / len(k_hist)) if k_hist else K,
+        "k_lo": min(k_hist) if k_hist else K, "k_hi": max(k_hist) if k_hist else K,
+        "draft_ms": t_draft / max(rounds, 1) * 1000, "verify_ms": t_verify / max(rounds, 1) * 1000,
+    }
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--stage", type=int, required=True)
+    ap.add_argument("--stage", type=int, default=0)
     ap.add_argument("--nstages", type=int, required=True)
+    ap.add_argument("--coordinator", action="store_true", help="in-house entry node: draft + drive, no 120B layers")
+    ap.add_argument("--served-head", action="store_true", help="stage 0 runs as a swarm serve node (embeds token ids)")
     ap.add_argument("--model", default="Qwen/Qwen2.5-3B-Instruct")        # target
     ap.add_argument("--draft", default="Qwen/Qwen2.5-0.5B-Instruct")
     ap.add_argument("--listen-port", type=int, default=29501)
@@ -196,9 +262,31 @@ def main():
     ap.add_argument("--max-new", type=int, default=128)
     ap.add_argument("--timeout", type=float, default=120.0)
     args = ap.parse_args()
+
+    if args.coordinator:                                    # in-house entry node: no 120B, just tokenizer + draft + swarm
+        tok = AutoTokenizer.from_pretrained(args.model)     # 20b tokenizer == 120b tokenizer
+        dh, dp = args.draft_server.split(":")
+        draft_sock = socket.socket(); draft_sock.connect((dh, int(dp)))
+        host, port = args.next.split(":")
+        pipe_sock = socket.socket(); pipe_sock.settimeout(args.timeout); pipe_sock.connect((host, int(port)))
+        print(f"[coord] in-house draft {args.draft_server} + swarm stage 0 at {args.next}; generating ...", flush=True)
+        ks = [int(x) for x in args.sweep.split(",")] if args.sweep else [args.K]
+        for kv in ks:
+            adaptive = (kv == 0) or (not args.sweep and args.adaptive)
+            r = coordinate(draft_sock, pipe_sock, tok, args.prompt, (6 if kv == 0 else kv),
+                           args.max_new, args.timeout, adaptive=adaptive)
+            if args.sweep:
+                print(f"[SWEEP K={kv}] {r['tok_s']:.2f} tok/s | {r['toks_per_traversal']:.2f} tok/traversal | "
+                      f"accept {r['mean_accept']:.2f} | draft {r['draft_ms']:.0f}ms + verify {r['verify_ms']:.0f}ms/round", flush=True)
+            else:
+                print(f"\n[coord] === OUTPUT ===\n{r['text']}\n", flush=True)
+                print(f"[coord] {r['n_tokens']} tok | {r['tok_s']:.2f} tok/s | {r['toks_per_traversal']:.2f} tok/traversal | "
+                      f"accept {r['mean_accept']:.2f} | draft {r['draft_ms']:.0f}ms + verify {r['verify_ms']:.0f}ms/round", flush=True)
+        return
+
     parts = load_stage(args.model, args.stage, args.nstages, device=args.device)
 
-    if args.stage != 0:
+    if args.stage != 0 or args.served_head:                 # swarm serve node (stage 0 embeds token ids)
         serve_spec(parts, args.stage, args.nstages, args.listen_port, args.next, args.timeout, args.device)
         return
 

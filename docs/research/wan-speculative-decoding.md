@@ -130,3 +130,21 @@ the way, and it has known fixes.
   (224 ms), so the linear-spec ceiling here is ~15 tok/s — the remaining gap to 20+
   is **tree speculation** (more accepted tokens per fixed-cost traversal) and, for
   more headroom, running the target stages under vLLM kernels too. Next: tree spec.
+- **2026-06-16 — the real c0mpute topology, end to end.** Built the **coordinator
+  architecture**: an in-house entry node holds *only* the draft + a thin driver
+  (no 120B layers; `specpipe.py --coordinator`), and the full gpt-oss-120b lives on
+  4 separate consumer GPUs scattered across the world — stage 0 (`--served-head`)
+  embeds the token ids the coordinator sends. Ran it for real: in-house draft (US)
+  + 120B across **Washington → France → UK → Singapore** (US→EU→Asia). It works,
+  output exact. Warm K=4: **2.82 tok/s**, and the breakdown is the whole story —
+  **draft 28 ms** (the in-house vLLM draft is cheap and local, as designed) but
+  **verify 1082 ms**: the activation literally circles the globe (4 sequential
+  inter-continental hops forward + relayed back) per traversal. So the architecture
+  and the draft are *solved*; what's left is the WAN cost, and the levers are now
+  concrete and ordered: (1) the scheduler must **cluster nodes by latency** — this
+  was the maximally-scattered worst case; a regional swarm is multiples faster;
+  (2) **direct tail→head return** (skip the relayed return, ~halve it); (3) **tree
+  speculation** to amortize the expensive traversal over more tokens. Also observed
+  live: one swarm node (Canada) **dropped offline mid-setup** and had to be replaced
+  — real consumer nodes vanish, which is exactly the Phase 4 fault-tolerance case
+  (re-route around a dead node, don't fail the request).
