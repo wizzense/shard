@@ -31,12 +31,13 @@ from pipeline import load_stage, run_block
 from node_kv import send_msg, recv_msg, EDGE_ERRORS, TransportError
 
 
-def serve_spec(parts, stage, nstages, listen_port, nxt, timeout, dev):
-    """a non-head stage under speculative decoding. identical plumbing to
-    pipeline.serve, but the op is `verify`: run this block on the K+1 proposed
-    tokens, relay forward, and (at the tail) return the argmax for *every*
-    position so the head can find the longest accepted prefix. `crop` rolls this
-    node's cache back to the last committed length before running."""
+def serve_spec(parts, stage, nstages, listen_port, nxt, timeout, dev, direct=False):
+    """a non-head stage under speculative decoding. the op is `verify`: run this
+    block on the K+1 proposed tokens, relay forward, and (at the tail) return the
+    argmax for every position. `crop` rolls this node's cache back before running.
+    direct=True: forward-only -- don't relay the result back up the chain (the tail
+    sends it straight to the coordinator). only non-tail stages use this path; the
+    direct tail is serve_tail_direct."""
     is_tail = stage == nstages - 1
     nxt_sock = None
     if not is_tail:
@@ -56,8 +57,11 @@ def serve_spec(parts, stage, nstages, listen_port, nxt, timeout, dev):
                     msg = recv_msg(conn)
                     if msg["op"] == "reset":
                         cache = DynamicCache()
-                        if nxt_sock: send_msg(nxt_sock, msg); recv_msg(nxt_sock)
-                        send_msg(conn, "ok"); continue
+                        if nxt_sock:
+                            send_msg(nxt_sock, msg)
+                            if not direct: recv_msg(nxt_sock)     # wait downstream ack (relay only)
+                        if not direct: send_msg(conn, "ok")       # ack predecessor (relay only)
+                        continue
                     if msg.get("crop") is not None:        # roll back the prior round's rejects
                         cache.crop(msg["crop"])
                     if "token_ids" in msg:                 # served head: coordinator sent token ids, embed here
@@ -65,18 +69,68 @@ def serve_spec(parts, stage, nstages, listen_port, nxt, timeout, dev):
                         h = run_block(x, parts, cache, msg["start"])
                     else:
                         h = run_block(msg["h"].to(dev), parts, cache, msg["start"])
-                    if is_tail:
+                    if is_tail:                            # relay tail (non-direct)
                         h = parts["norm"](h)
                         toks = parts["lm_head"](h).argmax(-1)[0].tolist()
+                        send_msg(conn, toks)
                     else:
                         send_msg(nxt_sock, {"op": "verify", "h": h.cpu(),
                                             "start": msg["start"], "crop": msg.get("crop")})
-                        toks = recv_msg(nxt_sock)
-                    send_msg(conn, toks); verifies += 1
+                        if not direct:                     # relay the result back up the chain
+                            send_msg(conn, recv_msg(nxt_sock))
+                    verifies += 1
                 except EDGE_ERRORS as e:
                     why = "stalled" if isinstance(e, socket.timeout) else "closed"
                     print(f"[s{stage}] edge {why} after {verifies} verifies ({type(e).__name__}); resetting", flush=True)
                     try: conn.close()
+                    except OSError: pass
+                    break
+
+
+def serve_tail_direct(parts, listen_port, timeout, dev):
+    """tail with DIRECT return: the result goes straight to the coordinator, not
+    relayed up the chain. two connections arrive on the listen port -- the
+    predecessor (activations) and the coordinator's return channel (which sends a
+    {op:hello_return} on connect). select tells them apart (only the return channel
+    has a message waiting; the predecessor is idle until driven). each verify's
+    result is sent on the return channel."""
+    import select
+    srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", listen_port)); srv.listen(2)
+    print(f"[tail] listening on :{listen_port} (predecessor + coordinator return, edge timeout {timeout:.0f}s)", flush=True)
+    while True:
+        c1, _ = srv.accept(); c2, _ = srv.accept()
+        ready, _, _ = select.select([c1, c2], [], [], timeout)
+        if not ready:
+            print("[tail] no return-channel handshake; resetting", flush=True)
+            c1.close(); c2.close(); continue
+        ret_conn = ready[0]
+        try:
+            hello = recv_msg(ret_conn)
+        except EDGE_ERRORS:
+            c1.close(); c2.close(); continue
+        if not (isinstance(hello, dict) and hello.get("op") == "hello_return"):
+            print("[tail] unexpected handshake; resetting", flush=True)
+            c1.close(); c2.close(); continue
+        pred_conn = c2 if ret_conn is c1 else c1
+        pred_conn.settimeout(timeout)
+        print("[tail] predecessor + coordinator-return connected", flush=True)
+        cache = DynamicCache(); verifies = 0
+        with torch.no_grad():
+            while True:
+                try:
+                    msg = recv_msg(pred_conn)
+                    if msg["op"] == "reset":
+                        cache = DynamicCache(); send_msg(ret_conn, "ok"); continue
+                    if msg.get("crop") is not None:
+                        cache.crop(msg["crop"])
+                    h = run_block(msg["h"].to(dev), parts, cache, msg["start"])
+                    h = parts["norm"](h)
+                    toks = parts["lm_head"](h).argmax(-1)[0].tolist()
+                    send_msg(ret_conn, toks); verifies += 1
+                except EDGE_ERRORS as e:
+                    print(f"[tail] edge after {verifies} verifies ({type(e).__name__}); resetting", flush=True)
+                    try: pred_conn.close(); ret_conn.close()
                     except OSError: pass
                     break
 
@@ -183,22 +237,25 @@ def generate_spec(draft, parts, tok, sock, prompt, K, max_new, dev, draft_dev, t
 
 
 def coordinate(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout,
-               adaptive=False, k_min=1, k_max=12):
+               adaptive=False, k_min=1, k_max=12, ret_sock=None):
     """the in-house coordinator (c0mpute entry node): holds NO 120B layers. it
     tokenizes, queries the in-house draft for K tokens, sends token ids into the
     swarm's stage 0 (which embeds + runs), reads back the verify, greedy-accepts.
     the whole 120B lives on the scattered swarm nodes; this node is just the entry
-    point plus the managed draft. lazy crop propagates to every swarm node."""
+    point plus the managed draft. lazy crop propagates to every swarm node.
+    ret_sock set => DIRECT return: send forward to stage 0, receive the verify
+    result straight from the tail (1 hop) instead of relayed back up the chain."""
     pipe_sock.settimeout(timeout)
+    rx = ret_sock if ret_sock is not None else pipe_sock     # where results come back (direct => tail)
     eos = tok.eos_token_id
     enc = tok.apply_chat_template([{"role": "user", "content": prompt}],
                                   add_generation_prompt=True, return_tensors="pt", return_dict=True)
     prompt_ids = enc["input_ids"][0].tolist()
     out = []
     try:
-        send_msg(pipe_sock, {"op": "reset"}); recv_msg(pipe_sock)
+        send_msg(pipe_sock, {"op": "reset"}); recv_msg(rx)
         send_msg(pipe_sock, {"op": "verify", "token_ids": prompt_ids, "start": 0})   # prefill
-        cur = recv_msg(pipe_sock)[-1]
+        cur = recv_msg(rx)[-1]
         pos = len(prompt_ids)
         out = [cur]
         rounds, accepted_total = 0, 0
@@ -212,7 +269,7 @@ def coordinate(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout,
             t_draft += time.time() - td
             tv = time.time()
             send_msg(pipe_sock, {"op": "verify", "token_ids": [cur] + drafts, "start": pos, "crop": tail_crop})
-            r = recv_msg(pipe_sock)
+            r = recv_msg(rx)
             t_verify += time.time() - tv
             n = 0
             for j in range(kc):
@@ -248,6 +305,8 @@ def main():
     ap.add_argument("--nstages", type=int, required=True)
     ap.add_argument("--coordinator", action="store_true", help="in-house entry node: draft + drive, no 120B layers")
     ap.add_argument("--served-head", action="store_true", help="stage 0 runs as a swarm serve node (embeds token ids)")
+    ap.add_argument("--direct-return", action="store_true", help="tail sends results straight to the coordinator (1 hop, not relayed)")
+    ap.add_argument("--tail", default="", help="coordinator: host:port of the tail, for the direct return channel")
     ap.add_argument("--model", default="Qwen/Qwen2.5-3B-Instruct")        # target
     ap.add_argument("--draft", default="Qwen/Qwen2.5-0.5B-Instruct")
     ap.add_argument("--listen-port", type=int, default=29501)
@@ -269,12 +328,18 @@ def main():
         draft_sock = socket.socket(); draft_sock.connect((dh, int(dp)))
         host, port = args.next.split(":")
         pipe_sock = socket.socket(); pipe_sock.settimeout(args.timeout); pipe_sock.connect((host, int(port)))
+        ret_sock = None
+        if args.direct_return:                              # open the return channel to the tail (once)
+            th, tp = args.tail.split(":")
+            ret_sock = socket.socket(); ret_sock.settimeout(args.timeout); ret_sock.connect((th, int(tp)))
+            send_msg(ret_sock, {"op": "hello_return"})
+            print(f"[coord] direct-return channel to tail at {args.tail}", flush=True)
         print(f"[coord] in-house draft {args.draft_server} + swarm stage 0 at {args.next}; generating ...", flush=True)
         ks = [int(x) for x in args.sweep.split(",")] if args.sweep else [args.K]
         for kv in ks:
             adaptive = (kv == 0) or (not args.sweep and args.adaptive)
             r = coordinate(draft_sock, pipe_sock, tok, args.prompt, (6 if kv == 0 else kv),
-                           args.max_new, args.timeout, adaptive=adaptive)
+                           args.max_new, args.timeout, adaptive=adaptive, ret_sock=ret_sock)
             if args.sweep:
                 print(f"[SWEEP K={kv}] {r['tok_s']:.2f} tok/s | {r['toks_per_traversal']:.2f} tok/traversal | "
                       f"accept {r['mean_accept']:.2f} | draft {r['draft_ms']:.0f}ms + verify {r['verify_ms']:.0f}ms/round", flush=True)
@@ -287,7 +352,11 @@ def main():
     parts = load_stage(args.model, args.stage, args.nstages, device=args.device)
 
     if args.stage != 0 or args.served_head:                 # swarm serve node (stage 0 embeds token ids)
-        serve_spec(parts, args.stage, args.nstages, args.listen_port, args.next, args.timeout, args.device)
+        if args.direct_return and args.stage == args.nstages - 1:
+            serve_tail_direct(parts, args.listen_port, args.timeout, args.device)
+        else:
+            serve_spec(parts, args.stage, args.nstages, args.listen_port, args.next, args.timeout,
+                       args.device, direct=args.direct_return)
         return
 
     draft, draft_sock = None, None

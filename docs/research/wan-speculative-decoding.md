@@ -168,3 +168,16 @@ the way, and it has known fixes.
   currently relays back through every node — cut that and ~halve the WAN → ~10
   tok/s), partial co-location, and tree speculation. The in-house draft is solved
   across every topology; what's left is purely WAN structure, and it's well understood.
+- **2026-06-16 — direct return, built and measured (+25%).** Implemented
+  `--direct-return`: the tail sends each verify result straight to the coordinator
+  (1 hop) instead of relaying it back up the chain (4 hops). The coordinator (entry
+  node) has no open inbound port, so it connects *out* to the tail and the tail
+  replies on that channel (a `hello_return` handshake, `select`-distinguished from
+  the predecessor's activation connection); the intermediate stages become
+  forward-only. Clustered US, warm K=4: **6.24 → 7.83 tok/s, verify 474 → 372 ms**,
+  output still exact (3.10 tok/traversal, unchanged). The save is real but modest
+  *here* because one return hop (WA2→Washington) was same-host — on a swarm of
+  fully-distinct nodes it saves more. Spectrum: global-scatter 2.82 → clustered-relay
+  6.24 → clustered-direct 7.83 → 2-machine (1 edge) 13.3. The gap to ~13 is the 4
+  *forward* hops (inherent to 4 separate nodes), closed by tree speculation +
+  partial co-location — neither touches the draft. Next: tree speculation.
