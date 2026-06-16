@@ -37,18 +37,27 @@ def _causal_mask(q_len, kv_len, start, window, dtype, device):
                        torch.full((), minv, dtype=dtype, device=device))[None, None]
 
 
-def run_block(h, parts, cache, start):
+def run_block(h, parts, cache, start, par=None, dep=None):
     """run this node's layer block. models with mixed attention (e.g. gpt-oss:
     alternating full / sliding-128 layers) get the right mask per layer; dense
-    models with no sliding window fall back to plain causal everywhere."""
+    models with no sliding window fall back to plain causal everywhere. when par/dep
+    are given (tree spec) the q tokens form a tree: per-node positions (start+depth)
+    and an ancestor mask instead of a plain causal one."""
     q_len = h.shape[1]
-    kv_len = start + q_len
-    pos = torch.arange(start, kv_len, device=h.device).unsqueeze(0)
-    pe = parts["rotary"](h, pos)
-    full = _causal_mask(q_len, kv_len, start, 0, h.dtype, h.device)
     sliding = parts.get("sliding")
-    win = _causal_mask(q_len, kv_len, start, parts.get("window", 0), h.dtype, h.device) \
-        if (sliding and parts.get("window")) else full
+    win_sz = parts.get("window", 0)
+    if par is not None:                          # tree verify
+        from tree import tree_mask
+        pos = torch.tensor([[start + dep[i] for i in range(q_len)]], device=h.device)
+        full = tree_mask(par, dep, start, 0, h.dtype, h.device)
+        win = tree_mask(par, dep, start, win_sz, h.dtype, h.device) if (sliding and win_sz) else full
+    else:
+        kv_len = start + q_len
+        pos = torch.arange(start, kv_len, device=h.device).unsqueeze(0)
+        full = _causal_mask(q_len, kv_len, start, 0, h.dtype, h.device)
+        win = _causal_mask(q_len, kv_len, start, win_sz, h.dtype, h.device) \
+            if (sliding and win_sz) else full
+    pe = parts["rotary"](h, pos)
     for i, layer in enumerate(parts["layers"]):
         mask = win if (sliding and sliding[i]) else full
         out = layer(h, attention_mask=mask, position_ids=pos,

@@ -181,3 +181,21 @@ the way, and it has known fixes.
   6.24 → clustered-direct 7.83 → 2-machine (1 edge) 13.3. The gap to ~13 is the 4
   *forward* hops (inherent to 4 separate nodes), closed by tree speculation +
   partial co-location — neither touches the draft. Next: tree speculation.
+- **2026-06-16 — tree speculation, built and measured. Mechanically correct; the
+  finding is the bottleneck moved.** Full tree spec end to end: a branching draft
+  (`draft_server.build_tree`), a tree attention mask + per-node positions
+  (`run_block`, `tree.py`), accept-best-path, and a lazy distributed cache **gather**
+  (keep only the accepted path's KV — the hard part, `tree.gather_cache`). On the
+  clustered 120B swarm, w=3/d=6 (19-node tree): **4.81 tokens/traversal vs linear's
+  3.10**, accept 3.76/round vs 2.10 — the tree does exactly what it should, more
+  tokens committed per WAN round-trip. **But wall-clock fell: 5.48 vs 7.83 tok/s**,
+  because the verify is **compute-bound, not latency-bound**: the eager-MXFP4 target
+  runs ~34 ms/token, so a 19-node tree costs ~4× the verify compute and that
+  outweighs the tokens-per-traversal gain. Tree spec is a *latency*-amortization
+  technique; it pays off only when the round-trip dominates and extra tree nodes are
+  nearly free. The bottleneck has moved cleanly: from the draft (solved with vLLM
+  kernels) to the **target's eager-MXFP4 verify compute** — the same wall, the same
+  fix (run the target stages under optimized/CUDA-graphed kernels). With a
+  latency-bound verify, the tree's 4.81 tokens/traversal converts directly to
+  throughput. Tree code is built, correct, and waiting on fast target kernels —
+  the last integration toward the 20 tok/s thesis.

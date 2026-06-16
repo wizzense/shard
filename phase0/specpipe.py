@@ -29,6 +29,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 from pipeline import load_stage, run_block
 from node_kv import send_msg, recv_msg, EDGE_ERRORS, TransportError
+from tree import accept_tree, gather_cache
 
 
 def serve_spec(parts, stage, nstages, listen_port, nxt, timeout, dev, direct=False):
@@ -62,20 +63,24 @@ def serve_spec(parts, stage, nstages, listen_port, nxt, timeout, dev, direct=Fal
                             if not direct: recv_msg(nxt_sock)     # wait downstream ack (relay only)
                         if not direct: send_msg(conn, "ok")       # ack predecessor (relay only)
                         continue
-                    if msg.get("crop") is not None:        # roll back the prior round's rejects
+                    if msg.get("gather") is not None:      # tree: keep last round's accepted-path KV
+                        gather_cache(cache, msg["gather"], dev)
+                    elif msg.get("crop") is not None:      # linear: roll back the prior round's rejects
                         cache.crop(msg["crop"])
+                    par, dep = msg.get("par"), msg.get("dep")
                     if "token_ids" in msg:                 # served head: coordinator sent token ids, embed here
                         x = parts["embed"](torch.tensor([msg["token_ids"]], device=dev))
-                        h = run_block(x, parts, cache, msg["start"])
+                        h = run_block(x, parts, cache, msg["start"], par=par, dep=dep)
                     else:
-                        h = run_block(msg["h"].to(dev), parts, cache, msg["start"])
+                        h = run_block(msg["h"].to(dev), parts, cache, msg["start"], par=par, dep=dep)
                     if is_tail:                            # relay tail (non-direct)
                         h = parts["norm"](h)
                         toks = parts["lm_head"](h).argmax(-1)[0].tolist()
                         send_msg(conn, toks)
                     else:
-                        send_msg(nxt_sock, {"op": "verify", "h": h.cpu(),
-                                            "start": msg["start"], "crop": msg.get("crop")})
+                        send_msg(nxt_sock, {"op": "verify", "h": h.cpu(), "start": msg["start"],
+                                            "crop": msg.get("crop"), "gather": msg.get("gather"),
+                                            "par": par, "dep": dep})
                         if not direct:                     # relay the result back up the chain
                             send_msg(conn, recv_msg(nxt_sock))
                     verifies += 1
@@ -122,9 +127,12 @@ def serve_tail_direct(parts, listen_port, timeout, dev):
                     msg = recv_msg(pred_conn)
                     if msg["op"] == "reset":
                         cache = DynamicCache(); send_msg(ret_conn, "ok"); continue
-                    if msg.get("crop") is not None:
+                    if msg.get("gather") is not None:
+                        gather_cache(cache, msg["gather"], dev)
+                    elif msg.get("crop") is not None:
                         cache.crop(msg["crop"])
-                    h = run_block(msg["h"].to(dev), parts, cache, msg["start"])
+                    h = run_block(msg["h"].to(dev), parts, cache, msg["start"],
+                                  par=msg.get("par"), dep=msg.get("dep"))
                     h = parts["norm"](h)
                     toks = parts["lm_head"](h).argmax(-1)[0].tolist()
                     send_msg(ret_conn, toks); verifies += 1
@@ -299,6 +307,64 @@ def coordinate(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout,
     }
 
 
+def coordinate_tree(draft_sock, pipe_sock, tok, prompt, tree_cfg, max_new, timeout, ret_sock=None):
+    """TREE spec-decode coordinator. each round the draft returns a *tree* of
+    candidate continuations rooted at cur; the swarm verifies the whole tree in one
+    traversal (tree mask); accept_tree walks the target's argmaxes for the longest
+    matching path. the accepted path's KV is kept on each node via a lazy gather
+    (piggybacked on the next verify). exact greedy => identical to plain decode."""
+    pipe_sock.settimeout(timeout)
+    rx = ret_sock if ret_sock is not None else pipe_sock
+    eos = tok.eos_token_id
+    enc = tok.apply_chat_template([{"role": "user", "content": prompt}],
+                                  add_generation_prompt=True, return_tensors="pt", return_dict=True)
+    prompt_ids = enc["input_ids"][0].tolist()
+    out = []
+    try:
+        send_msg(pipe_sock, {"op": "reset"}); recv_msg(rx)
+        send_msg(pipe_sock, {"op": "verify", "token_ids": prompt_ids, "start": 0})   # linear prefill
+        cur = recv_msg(rx)[-1]
+        pos = len(prompt_ids)
+        out = [cur]
+        rounds, accepted_total, m_total, gather_prev = 0, 0, 0, None
+        t_draft = t_verify = 0.0
+        t0 = time.time()
+        while len(out) < max_new and cur != eos:
+            td = time.time()
+            send_msg(draft_sock, {"ids": prompt_ids + out, "tree": tree_cfg})   # ask for a tree
+            tr = recv_msg(draft_sock)
+            t_draft += time.time() - td
+            tk, par, dep = tr["tok"], tr["par"], tr["dep"]
+            children = [[] for _ in tk]
+            for i, p in enumerate(par):
+                if p != -1: children[p].append(i)
+            tv = time.time()
+            send_msg(pipe_sock, {"op": "verify", "token_ids": tk, "par": par, "dep": dep,
+                                 "start": pos, "gather": gather_prev})
+            targ = recv_msg(rx)                                # one argmax per tree node
+            t_verify += time.time() - tv
+            committed, kept = accept_tree(tk, par, {i: c for i, c in enumerate(children)}, targ)
+            out.extend(committed); cur = committed[-1]
+            gather_prev = list(range(pos)) + [pos + ki for ki in kept]   # keep prefix + accepted path
+            pos += len(kept)
+            rounds += 1; accepted_total += len(kept) - 1; m_total += len(tk)
+            if eos in committed:
+                break
+    except EDGE_ERRORS as e:
+        raise TransportError(f"pipeline edge failed at token {len(out)} ({type(e).__name__}: {e})") from e
+    dt = time.time() - t0
+    if eos in out:
+        out = out[:out.index(eos)]
+    return {
+        "text": tok.decode(out, skip_special_tokens=True), "n_tokens": len(out), "rounds": rounds,
+        "mean_accept": accepted_total / max(rounds, 1),
+        "toks_per_traversal": len(out) / max(rounds, 1),
+        "tree_nodes": m_total / max(rounds, 1),
+        "tok_s": len(out) / max(dt, 1e-9),
+        "draft_ms": t_draft / max(rounds, 1) * 1000, "verify_ms": t_verify / max(rounds, 1) * 1000,
+    }
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--stage", type=int, default=0)
@@ -307,6 +373,7 @@ def main():
     ap.add_argument("--served-head", action="store_true", help="stage 0 runs as a swarm serve node (embeds token ids)")
     ap.add_argument("--direct-return", action="store_true", help="tail sends results straight to the coordinator (1 hop, not relayed)")
     ap.add_argument("--tail", default="", help="coordinator: host:port of the tail, for the direct return channel")
+    ap.add_argument("--tree", default="", help="coordinator: tree spec 'width,depth' (e.g. 3,6) -> tree speculation")
     ap.add_argument("--model", default="Qwen/Qwen2.5-3B-Instruct")        # target
     ap.add_argument("--draft", default="Qwen/Qwen2.5-0.5B-Instruct")
     ap.add_argument("--listen-port", type=int, default=29501)
@@ -335,6 +402,16 @@ def main():
             send_msg(ret_sock, {"op": "hello_return"})
             print(f"[coord] direct-return channel to tail at {args.tail}", flush=True)
         print(f"[coord] in-house draft {args.draft_server} + swarm stage 0 at {args.next}; generating ...", flush=True)
+        if args.tree:                                       # TREE speculation
+            w, d = (int(x) for x in args.tree.split(","))
+            cfg = {"width": w, "depth": d}
+            for _ in range(2):                              # cold + warm
+                r = coordinate_tree(draft_sock, pipe_sock, tok, args.prompt, cfg, args.max_new, args.timeout, ret_sock=ret_sock)
+                print(f"[TREE w={w},d={d}] {r['tok_s']:.2f} tok/s | {r['toks_per_traversal']:.2f} tok/traversal | "
+                      f"accept {r['mean_accept']:.2f}/round | {r['tree_nodes']:.0f} tree nodes | "
+                      f"draft {r['draft_ms']:.0f}ms + verify {r['verify_ms']:.0f}ms/round", flush=True)
+            print(f"\n[coord] === OUTPUT ===\n{r['text']}\n", flush=True)
+            return
         ks = [int(x) for x in args.sweep.split(",")] if args.sweep else [args.K]
         for kv in ks:
             adaptive = (kv == 0) or (not args.sweep and args.adaptive)
