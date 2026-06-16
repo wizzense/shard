@@ -199,3 +199,14 @@ the way, and it has known fixes.
   latency-bound verify, the tree's 4.81 tokens/traversal converts directly to
   throughput. Tree code is built, correct, and waiting on fast target kernels —
   the last integration toward the 20 tok/s thesis.
+
+- **2026-06-16 — fast-verify de-risked: the gpt-oss layer block CUDA-graphs (4.2x,
+  exact).** Probe (`research/probe_cudagraph.py`): a 9-layer 120B stage forward,
+  eager **22.9 ms** vs CUDA-graph replay **5.4 ms = 4.2x**, output bit-identical
+  (max-diff 0.0000). gpt-oss's MoE routing captures (batched all-experts kernel, not
+  dynamic gather) -- the ~34 ms/token eager verify is ~75% removable launch/Python
+  overhead, same as the draft. Projected: cutting the verify compute 4.2x drops the
+  clustered linear-direct verify 372 -> ~190 ms -> round ~215 ms -> ~14 tok/s, and
+  makes the verify latency-bound so tree spec finally pays off too. Build: a static
+  pre-allocated KV cache + captured stage-forward graph (the realization of the
+  fast verify). The path to 10-15 tok/s on 4 separate consumer GPUs is real.
