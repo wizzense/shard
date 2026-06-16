@@ -35,6 +35,8 @@ The payoff. Add the draft-verify loop.
 - Adaptive K based on measured latency + live acceptance rate.
 - **Pass = land in the paper's regime: meaningfully more tok/s than Phase 1 on the same links, in the ~8-9 tok/s ballpark at 80ms for a small target.** This is the proof the whole approach is real.
 
+**✓ PASSED (2026-06-15), and now proven at 120B scale over WAN (2026-06-16).** The draft-verify loop landed first on the 2-node 14B split (up to 6× tokens/traversal co-located) and over a real transatlantic 3B link (**3.4× on code, 20.5 tok/s**) — `phase0/specdec.py`. It now runs on the full **gpt-oss-120b split across four nodes / two machines over WAN** (Sweden ↔ North Carolina) via `phase0/specpipe.py` — the same draft-verify, generalized to the N-stage gpt-oss pipeline, with a gpt-oss-20b draft on its own GPU at the entry node and exact greedy acceptance. Warm steady-state: plain **4.67 tok/s → spec-decode (K=4) ~6.5 tok/s, 1.4×**, output token-for-token identical to plain. The multiplier is honest-but-modest at this scale because gpt-oss ships no draft below 20b (~62 ms/token), so the draft eats part of the round-trip it saves — the gain scales with WAN latency and inversely with draft cost. Two findings: MXFP4 kernels JIT-compile (warm is the honest number), and **fixed K beats adaptive K** here (each K change recompiles kernels for a new shape). Remaining: a lighter tokenizer-matched draft for 100B+ targets, and fp8 activation quant.
+
 ## Phase 3 — permissionless swarm + c0mpute (target: 1-2 weeks)
 
 - One-line installer, auto-installs deps, plug and play.

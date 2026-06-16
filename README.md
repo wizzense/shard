@@ -22,8 +22,9 @@ the model is never materialized on that node.
 That second row is the whole thesis in one line: a frontier-size model, far too
 big for any consumer GPU, served across machines on different networks over the
 open internet — the activations physically crossing the continent on every token.
-Plain decode is latency-bound (3.5 tok/s); speculative decoding (below) is what
-turns that into usable throughput, and is the next thing to layer on at this scale.
+Plain decode is latency-bound; speculative decoding now layers on **at this 120B
+scale** to push it past the plain baseline — exact output, measured over a real
+transatlantic link. See [Speculative decoding](#speculative-decoding-phase-2).
 
 ## Status
 
@@ -80,6 +81,29 @@ Plain decode is latency-bound — one round-trip per token (~133 ms/step measure
 A spec-decode round costs one round-trip too but commits several tokens, turning a
 latency-bound 6 tok/s into 20 on code: the difference between unusable and usable
 over the open internet.
+
+### At 120B scale, over WAN
+
+The same draft-and-verify, now on the full **gpt-oss-120b split across four nodes
+on two machines** (Sweden ↔ North Carolina, a real transatlantic hop). The draft
+is gpt-oss-20b on its own GPU at the entry node — the smallest model that shares
+the 120b tokenizer, which exact greedy acceptance requires. Warm, steady-state:
+
+| Setup | Plain decode | Spec-decode (K=4) | Speedup |
+|-------|--------------|-------------------|---------|
+| 4-stage 120b, 2 machines, transatlantic WAN | 4.67 tok/s | 6.5 tok/s | 1.4× |
+
+The draft predicts the 120b **2.5 tokens ahead per round** (3.5 committed per
+traversal), output exact. The multiplier is smaller than the 3B case above because
+the draft is heavier relative to the target: gpt-oss ships no model below 20b, and
+that 20b decodes at ~62 ms/token, eating part of the round-trip it saves. The gain
+scales with WAN latency and inversely with draft cost — a lighter tokenizer-matched
+draft, or a higher-latency link (real home connections), widens it.
+
+Two findings worth recording: gpt-oss's MXFP4 kernels JIT-compile on first use, so
+the warm steady-state is the honest number (a cold first run reads ~30 % slow); and
+a **fixed K beats adaptive K** here, because each change in K recompiles kernels for
+a new sequence-length shape — the recompiles cost more than the adaptivity saves.
 
 ## How it works
 

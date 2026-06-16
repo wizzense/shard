@@ -190,6 +190,7 @@ def main():
     ap.add_argument("--next", default="")              # host:port of stage+1 (non-tail nodes)
     ap.add_argument("--prompt", default="Explain decentralized computing in two sentences.")
     ap.add_argument("--max-new", type=int, default=64)
+    ap.add_argument("--runs", type=int, default=1, help="generations on one load; run>0 are warm")
     ap.add_argument("--timeout", type=float, default=30.0)
     args = ap.parse_args()
     dev = "cuda"
@@ -197,13 +198,14 @@ def main():
 
     if args.stage == 0:
         tok = AutoTokenizer.from_pretrained(args.model)
-        try:
-            r = drive(parts, tok, args.next, args.prompt, args.max_new, dev, args.timeout)
-        except TransportError as e:
-            print(f"\n[s0] TRANSPORT FAILURE: {e}", flush=True); raise SystemExit(2)
+        for run in range(args.runs):                 # run>0 are warm (JIT kernels already compiled)
+            try:
+                r = drive(parts, tok, args.next, args.prompt, args.max_new, dev, args.timeout)
+            except TransportError as e:
+                print(f"\n[s0] TRANSPORT FAILURE: {e}", flush=True); raise SystemExit(2)
+            print(f"[run {run}{' warm' if run else ' cold'}] {r['n_tokens']} tokens | prefill {r['prefill_s']:.2f}s | "
+                  f"decode {r['tok_s']:.2f} tok/s", flush=True)
         print(f"\n[s0] === OUTPUT ===\n{r['text']}\n", flush=True)
-        print(f"[s0] {r['n_tokens']} tokens, total {r['total_s']:.1f}s | prefill {r['prefill_s']:.2f}s | "
-              f"decode {r['tok_s']:.2f} tok/s ({args.nstages}-stage pipeline)", flush=True)
     else:
         serve(parts, args.stage, args.nstages, args.listen_port, args.next, args.timeout, dev)
 
