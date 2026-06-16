@@ -148,3 +148,23 @@ the way, and it has known fixes.
   live: one swarm node (Canada) **dropped offline mid-setup** and had to be replaced
   — real consumer nodes vanish, which is exactly the Phase 4 fault-tolerance case
   (re-route around a dead node, don't fail the request).
+- **2026-06-16 — clustered re-run: geography was most of the penalty.** Same
+  coordinator architecture, same exact 120B, but the 4 swarm nodes moved from 4
+  continents to 4 US boxes (~cross-country hops). Warm K=4: **6.24 tok/s, verify
+  474 ms** — vs the global-scatter **2.82 tok/s, verify 1082 ms**. So clustering
+  alone **2.2×'d** it and halved the verify; the draft stayed cheap (28 ms) the
+  whole time. The full measured spectrum now reads:
+
+  | topology | WAN edges | verify | tok/s |
+  |---|---|---|---|
+  | 2 machines, transatlantic | 1 | 224 ms | 13.3 |
+  | 4 nodes, clustered US | 4 | 474 ms | 6.24 |
+  | 4 nodes, global scatter | 4 | 1082 ms | 2.82 |
+
+  Two levers fall out, cleanly: **hop latency** (cluster nodes — worth 2.2×, the
+  scheduler's job) and **edge count** (4 separate nodes pay 4 WAN edges vs the
+  2-machine's 1; even clustered, more hops cost). The remaining gap to ~13 is
+  addressable without touching the draft: **direct tail→head return** (the result
+  currently relays back through every node — cut that and ~halve the WAN → ~10
+  tok/s), partial co-location, and tree speculation. The in-house draft is solved
+  across every topology; what's left is purely WAN structure, and it's well understood.
