@@ -110,10 +110,12 @@ def generate_spec(draft, parts, tok, sock, prompt, K, max_new, dev, draft_dev, t
         rounds, accepted_total = 0, 0
         kc, ema_n, k_hist = K, float(K), []
         tail_crop = None                                   # lazy downstream rollback, piggybacked
+        t_draft = t_verify = 0.0                            # round-budget instrumentation
         t0 = time.time()
         with torch.no_grad():
             while len(out) < max_new and cur != eos:
                 # 1. draft proposes kc tokens (feed cur, d_1..d_kc -> keep d_1..d_kc)
+                td = time.time()
                 drafts, dtok = [], cur
                 for i in range(kc + 1):
                     dl = draft(input_ids=torch.tensor([[dtok]], device=draft_dev),
@@ -121,10 +123,13 @@ def generate_spec(draft, parts, tok, sock, prompt, K, max_new, dev, draft_dev, t
                     dtok = int(dl[0, -1].argmax())
                     if i < kc:
                         drafts.append(dtok)
+                t_draft += time.time() - td
                 # 2. verify [cur, d_1..d_kc] in one traversal (carry the prior round's rollback)
+                tv = time.time()
                 h = embed([cur] + drafts)
                 send_msg(sock, {"op": "verify", "h": h.cpu(), "start": pos, "crop": tail_crop})
                 r = recv_msg(sock)
+                t_verify += time.time() - tv
                 # 3. greedy acceptance: longest prefix with d_j == r_j
                 n = 0
                 for j in range(kc):
@@ -161,6 +166,7 @@ def generate_spec(draft, parts, tok, sock, prompt, K, max_new, dev, draft_dev, t
         "tok_s": len(out) / max(dt, 1e-9),
         "mean_K": (sum(k_hist) / len(k_hist)) if k_hist else K,
         "k_lo": min(k_hist) if k_hist else K, "k_hi": max(k_hist) if k_hist else K,
+        "draft_ms": t_draft / max(rounds, 1) * 1000, "verify_ms": t_verify / max(rounds, 1) * 1000,
     }
 
 
@@ -204,7 +210,8 @@ def main():
                                    args.max_new, args.device, args.draft_device, args.timeout, adaptive=adaptive)
                 tag = f"adaptive(mean {rr['mean_K']:.1f})" if adaptive else f"K={kv}"
                 print(f"[SWEEP {tag}] {rr['tok_s']:.2f} tok/s | {rr['toks_per_traversal']:.2f} tok/traversal | "
-                      f"accept {rr['mean_accept']:.2f} | {rr['n_tokens']} tok in {rr['rounds']} rounds", flush=True)
+                      f"accept {rr['mean_accept']:.2f} | draft {rr['draft_ms']:.0f}ms + verify {rr['verify_ms']:.0f}ms/round "
+                      f"-> async ceiling {rr['toks_per_traversal']/(max(rr['draft_ms'],rr['verify_ms'])/1000):.1f} tok/s", flush=True)
         finally:
             sock.close()
         return
