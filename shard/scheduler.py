@@ -35,9 +35,23 @@ class Scheduler:
         """
         raise NotImplementedError  # phase 0 (static) / phase 3 (dynamic+heterogeneous)
 
-    def topology(self) -> list[str]:
-        """order nodes into the pipeline, preferring low-rtt edges."""
-        raise NotImplementedError  # phase 1
+    def topology(self, coordinator_id: str, k: int | None = None) -> list[str]:
+        """order nodes into the cheapest pipeline loop on the measured rtt mesh.
+
+        the coordinator is the depot (entry hop out, direct-return hop back); the stage
+        order is the min-latency Hamiltonian loop through it. with k set, also selects the
+        best k of the joined nodes. see shard/topology.py for the solver.
+        """
+        from .topology import optimal_loop, select_and_order
+        ids = [nid for nid in self.nodes if nid != coordinator_id]
+        coord = self.nodes[coordinator_id]
+        L = [[0.0 if a == b else self.nodes[a].rtt_ms[b] for b in ids] for a in ids]
+        c_out = [coord.rtt_ms[a] for a in ids]
+        c_in = [self.nodes[a].rtt_ms[coordinator_id] for a in ids]
+        idx = list(range(len(ids)))
+        order, _ = (select_and_order(idx, L, c_out, c_in, k) if k else
+                    optimal_loop(idx, L, c_out, c_in))
+        return [ids[i] for i in order]
 
     def on_drop(self, node_id: str) -> None:
         """node died mid-generation: reassign its block, rebuild pipeline, retry in-flight."""
