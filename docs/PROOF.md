@@ -46,6 +46,7 @@ same result.
 ```json
 {
   "run_id": "...", "utc": "...", "shard_commit": "<git sha>",
+  "engine_file": "research/...", "engine_sha256": "<hash of the engine source that ran>",
   "model": "gpt-oss-120b", "quant": "mxfp4",
   "prompt": "...", "output_text": "...",
   "output_token_ids": [ ... ], "output_sha256": "<hash of token ids>",
@@ -56,9 +57,14 @@ same result.
      "gpu_uuid": "GPU-...", "gpu_name": "RTX 4090"}
   ],
   "edges": [ {"from": "stage0", "to": "stage1", "rtt_ms": 41.2} ],
-  "reference": {"source": "single-node decode", "tokens_match": true}
+  "reference": {"source": "single-node decode", "tokens_match": true, "token_ids": [ ... ]}
 }
 ```
+
+`engine_sha256` is the hash of the exact engine source that produced the run — the precise,
+commit-independent reproducibility anchor (a commit can't embed its own hash, so this is what a
+skeptic checks the engine file against). `reference.token_ids` lets anyone re-run the verifier with
+`--ref-tokens` and confirm the lossless check directly, rather than trusting the `tokens_match` flag.
 
 ## How to verify a receipt (skeptic's checklist)
 
@@ -69,14 +75,24 @@ same result.
    the token ids hash to `output_sha256`.
 4. **Reproduce:** check out `shard_commit`, bring up nodes, run the embedded commands.
 
+## Receipts on file
+
+- **GLM-5.2 744B NVFP4 at ~30 tok/s over WAN** — 7 GPUs in 6 US states, pipelined spec-decode
+  + CUDA-graphed draft: [`receipts/glm52-nvfp4-wan-20260618.json`](receipts/glm52-nvfp4-wan-20260618.json).
+- **gpt-oss-120B at ~18–25 tok/s over WAN** — the earlier Phase-2 result
+  (see [README](../README.md) and [research log](research/wan-speculative-decoding.md)).
+
 ## Scope / honesty
 
-- The headline result this proves is **gpt-oss-120B at ~18–25 tok/s over WAN** (the shipped
-  Phase-2 result — see [README](../README.md) and
-  [research log](research/wan-speculative-decoding.md)).
-- The **GLM-5.2** quantized pipeline-parallel path is de-risked but not yet deployed at swarm
-  scale (see [research/glm-5.2-on-consumer-blackwell.md](research/glm-5.2-on-consumer-blackwell.md));
-  its receipt will be added when that run happens.
+- Decoding is **greedy and deterministic**: same prompt → same tokens, every run. The receipt's
+  `tokens_match` is the **lossless-optimization check** — the CUDA-graphed speculative path is
+  byte-identical to the plain eager path of the *same engine* (computed from two real run dumps),
+  so the speedup changes nothing about the output.
+- For a **quantized** model, bit-exact reproduction across *different* engines/backends is not
+  achievable in general (and not unique to Shard): batched vs single-token kernels round
+  floating-point differently, so at a genuine near-tie two correct greedy decoders can pick
+  different — both valid — continuations. So the proof is *within-engine* reproducibility +
+  coherent correct output, not "matches your laptop's HF decode token-for-token."
 - A receipt proves *a specific run* was real, distributed, and correct. It is not a claim of
   uptime, throughput SLAs, or that every run hits the same number — tok/s is prompt- and
   topology-dependent and reported as a range.

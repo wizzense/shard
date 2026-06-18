@@ -16,8 +16,13 @@ weights/
 phase0/fleet.py
 phase0/finish_deploy.py
 phase0/launch_ring.py
+phase0/cg_run.sh
+phase0/cgd_run.sh
+phase0/cg_sweep.sh
+phase0/make_receipt.py
 phase0/flashinfer_cache.tgz
 RESULT_kv.txt
 RESULT_spec.txt
 RESULTS.md
 SWARM_DEPLOY_STATE.md
+RESUME_B.md

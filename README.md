@@ -7,57 +7,59 @@ order. No datacenter, no single host, and no node ever holds the whole model.
 
 Shard is the inference engine for [c0mpute](https://c0mpute.ai).
 
-## gpt-oss-120B across four consumer GPUs, over the open internet
+## GLM-5.2 (744B) across seven scattered prosumer GPUs, over the open internet
 
-**120 billion parameters, served at ~18–25 tok/s across four RTX 4090s in
-different US states — over WAN, output exact.** The model is split 9 layers per
-node across 4× RTX 4090 (~16 GB each); no single 24 GB card holds it, four do.
-Each node loads **only its own block** — the rest of the model is never
-materialized on it. A small in-house draft proposes tokens and the distributed
-120B verifies them in one traversal of the chain.
+**A 744-billion-parameter frontier model, served at ~30 tok/s across seven
+prosumer Blackwell GPUs in six US states — over WAN, greedy, deterministic.**
+GLM-5.2 (NVFP4, 78 layers) is split **13 layers per node** across 6× RTX PRO 6000;
+no single card holds it, six do. Each node loads **only its own block**. A coordinator
+holds no model layers — just the token embedding/head and a small CUDA-graphed
+GLM-4-9B draft that proposes tokens, which the distributed 744B verifies.
 
 | Setup | tok/s (warm) | Output |
 |-------|--------------|--------|
-| 120B, 4× RTX 4090 across 3 US sites (Kansas ×2 · Illinois · N. Carolina), WAN, spec-decode + fast verify | **18.5 – 24.8** (prompt-dependent) | exact greedy decode |
+| GLM-5.2 744B NVFP4, 6× RTX PRO 6000 across 6 US states (NV · TX · MN · MO · UT + WA coord), WAN, pipelined spec-decode + CUDA-graphed draft | **~30** | greedy, deterministic |
+
+Every run emits a **verifiable receipt** — distinct GPU UUIDs / public IPs / regions,
+measured WAN edge RTTs (22–75 ms), the output token hash, and a lossless-optimization
+check. This run's receipt: [`docs/receipts/glm52-nvfp4-wan-20260618.json`](docs/receipts/glm52-nvfp4-wan-20260618.json)
+(see [docs/PROOF.md](docs/PROOF.md) for how a skeptic checks it).
 
 That is the whole thesis in one line: a frontier-size model, far too big for any
-consumer GPU, served across machines on different networks — activations crossing
+single card, served across machines on different networks — activations crossing
 the country on every traversal — at a speed that is actually usable.
 
 ## How it got there
 
-Plain pipeline decode over WAN is latency-bound: one round-trip per token, ~1–6
-tok/s, unusable. The path to 25 was a sequence of measured steps, each recorded in
-the [research log](docs/research/wan-speculative-decoding.md):
+Plain pipeline decode over WAN is latency-bound: one round-trip per token, ~1–2
+tok/s, unusable. The path to 30 was a sequence of measured steps, each committed:
 
-| Step | tok/s (120B, WAN) | What changed |
-|------|-------------------|--------------|
-| plain decode | ~3–5 | latency-bound baseline |
-| + speculative decoding (in-house 20B draft) | 13.3 | one traversal commits several tokens |
-| + coordinator + clustered US + direct return | 7.83\* | real 4-scattered-GPU topology, tail returns to the entry node in one hop |
-| **+ fast verify (static-cache CUDA graph)** | **18.6 → 24.8** | the verify compute, not the WAN, was the wall |
-
-\*the 7.83 is the harder 4-separate-box topology that the fast verify then lifts to ~19–25.
+| Step | tok/s | What changed |
+|------|-------|--------------|
+| plain KV decode | 1.87 | latency-bound baseline (one token per round-trip) |
+| + deep-draft spec-decode (GLM-4-9B), relay-back | 1.99 | one traversal commits several tokens |
+| + **ring direct-return** | 2.94 | tail returns to the coordinator in one hop — 7 ring hops, not a 12-hop relay-back |
+| + **async pipelining** | 16.6 | overlap many verify traversals in flight → throughput-bound, not latency-bound; the WAN drops to ~5% of the loop |
+| + **CUDA-graphed draft** | **~30** | with the WAN hidden, the draft was 94% of the loop; CUDA-graphing it (3.8×) lifts the whole pipeline |
 
 **The key insight: over WAN the round-trip is the scarce resource, not compute** —
 so speculative decoding, marginal in a datacenter, becomes the whole game. A small
-draft proposes K tokens; the distributed 120B verifies all K in a single pipeline
-traversal (the same round-trip plain decode spends on one token); greedy acceptance
-keeps the output **token-for-token identical to plain decode**.
+draft proposes K tokens; the distributed 744B verifies them in a single pipeline
+traversal; greedy acceptance commits the verified prefix. Then two compounding wins:
 
-Two non-obvious results made it fast:
+- **Async pipelining over the ring.** Because the ring is direct-return, multiple
+  verify chunks can be in flight at once. The coordinator drafts a continuous stream
+  and pumps overlapping chunks into the pipeline without waiting — so the loop runs at
+  the pipeline's *throughput*, not its *latency*. The WAN, which dominated every prior
+  attempt, drops to ~5% of the loop.
 
-- **In-house draft (no training).** gpt-oss-20B under vLLM on one 4090 drafts at
-  ~5 ms/tok vs 62 ms in plain transformers — a 12× cheaper draft from optimized
-  MXFP4 kernels + CUDA graphs, no training. It runs on the entry node; it holds no
-  authority (the target verifies every token), so centralizing it is safe.
-
-- **Fast verify (static-cache CUDA graph).** The eager verify was ~75% removable
-  Python / kernel-launch overhead. Capturing a 120B stage's forward as a CUDA
-  graph against a pre-allocated static KV cache makes it **bit-exact and ~5×
-  faster** — cutting the clustered verify from 372 ms to ~135 ms (warm) and taking
-  the 4-separate-GPU topology from 7.83 to **24.8 tok/s**, past this track's 20
-  tok/s success criterion. (`phase0/fastverify.py`, `research/fastverify_graph.py`.)
+- **CUDA-graphed draft.** Once the WAN is hidden, the GLM-4-9B draft (single-token
+  decode, launch-overhead-bound) becomes 94% of the loop. Capturing it as a CUDA graph
+  cuts it 3.8× (49.7→13.1 ms/tok). The hard part was making the static KV cache honor
+  speculative rollback under graph capture — solved by driving the write slot through a
+  static-address position tensor; the result is **byte-identical to the eager path**, so
+  the optimization is provably lossless. (`research/glm_swarm_nvfp4_cg.py`,
+  `research/glm_swarm_nvfp4_cg_diff.py`.)
 
 ## How it works
 
@@ -65,18 +67,20 @@ A transformer is a stack of layers. Shard splits the stack into contiguous block
 one block per GPU. A token is produced by passing activations through the blocks in
 order; each node keeps a KV-cache for its own layers.
 
-    coordinator ──► draft (20B, proposes K)
+    coordinator (WA) ── GLM-4-9B draft (CUDA-graphed) + embed / lm_head
          │
-         └─► stage 0 ──► stage 1 ──► stage 2 ──► stage 3 ──┐  (verify K+1 in one traversal)
-             KS           KS          IL          NC        │
-             ▲────────────── direct return ─────────────────┘
+         ├─► stage0 ─► stage1 ─► stage2 ─► stage3 ─► stage4 ─► stage5 ─┐  (verify chunks, pipelined)
+         │   NV         TX         (·)        MN         MO        UT    │
+         │   0–12       13–25      26–38      39–51      52–64     65–77 │
+         └──────────────── direct return (tail → coordinator, 1 hop) ────┘
 
-The coordinator (entry node) holds **no** 120B layers — only the draft and a thin
-driver. Each round: the draft proposes K tokens; the coordinator sends `[cur, d₁..dₖ]`
+The coordinator (entry node) holds **no** 744B layers — only the draft and a thin
+driver. Each round: the draft proposes K tokens; the coordinator ships `[cur, d₁..dₖ]`
 into stage 0, which embeds them; the chain verifies all K+1 in one forward traversal;
 the tail returns the argmaxes straight to the coordinator (one hop, not relayed back);
-the coordinator greedy-accepts the longest matching prefix. The verify forward on each
-stage replays a captured CUDA graph against a static KV cache — the fast verify.
+the coordinator greedy-accepts the longest matching prefix. Many such chunks are in
+flight at once (the pipeline), and the draft replays a captured CUDA graph against a
+static KV cache.
 
 ## Why this is hard
 
@@ -85,16 +89,15 @@ on the open internet, fast enough to be usable, is not — and that is the part 
 owns.
 
 - **Latency.** Every token traverses the whole pipeline. Speculative decoding amortizes
-  one round-trip over many committed tokens; the fast verify keeps the traversal cheap
-  enough that the WAN, not the compute, sets the floor.
+  one round-trip over many committed tokens; pipelining overlaps the traversals so the
+  WAN stops being the floor; the CUDA-graphed draft keeps what's left cheap.
 - **Transport.** The activation tensor crosses the public internet on every step. Shard
   owns this layer — supervised edges that fail fast and reconnect, per-edge health
   logging, no opaque "broken pipe." The wire is authenticated and encrypted with
   pickle-free framing (`phase0/wire.py`; ChaCha20-Poly1305 under a shared `SHARD_PSK`),
   so a passive observer learns nothing and a forged frame is a parse error, not code
   execution. (NAT hole-punching + relay fallback for home routers is the remaining
-  Phase 1 work, where per-node identities + a keyed handshake replace the shared key;
-  a direct open port stands in today.)
+  Phase 1 work; a direct open port stands in today.)
 
 ## Design principles
 
@@ -112,16 +115,24 @@ Shard is c0mpute infrastructure, held to its three guarantees:
   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). It is the number-one open problem and is
   treated as one.
 
+## Earlier milestone: gpt-oss-120B at ~18–25 tok/s over WAN
+
+The first Phase-2 result: **120B across 4× RTX 4090 in different US states, ~18–25
+tok/s, exact** — same playbook (speculative decode + a CUDA-graph fast verify), on a
+smaller model. GLM-5.2 (above) is the current flagship: 6× the parameters, faster,
+on a longer scattered ring. Full design record:
+[docs/research/wan-speculative-decoding.md](docs/research/wan-speculative-decoding.md)
+and [docs/research/glm-5.2-on-consumer-blackwell.md](docs/research/glm-5.2-on-consumer-blackwell.md).
+
 ## Repository layout
 
-    phase0/   the working engine — node_kv.py (2-node split), pipeline.py (N-stage),
-              specpipe.py (speculative decoding over the split), fastverify.py
-              (static-cache CUDA-graph verify), tree.py (tree speculation), bench.py
-    research/ the WAN spec-decode experiments — draft_server.py (in-house vLLM draft),
-              fastverify_*.py (the de-risking probes), launch scripts
-    docs/     ARCHITECTURE, ROADMAP, and research/wan-speculative-decoding.md (the
-              full design record + measured milestone log)
-    shard/    engine module scaffolding (node, transport, specdec, scheduler)
+    phase0/   transport + deploy: wire.py (sealed framing), mesh.py (edge RTTs),
+              proof_receipt.py (run-receipt build/verify), launch + bench tooling
+    research/ the swarm drivers — glm_swarm_nvfp4_kv.py (NVFP4 KV-cached stages),
+              glm_swarm_nvfp4_pipe.py (pipelined spec-decode), glm_swarm_nvfp4_cg.py
+              (CUDA-graphed draft), *_cg_diff.py / *_fwdcmp.py (correctness diagnostics)
+    docs/     ARCHITECTURE, ROADMAP, PROOF.md, receipts/, and the research records
+    shard/    engine module scaffolding (node, transport, specdec, topology)
 
 ## Roadmap
 
@@ -129,12 +140,11 @@ Shard is c0mpute infrastructure, held to its three guarantees:
 - **Phase 1 — WAN.** Different networks behind NAT: hole-punching, relay fallback,
   activation quantization, edge supervision.
 - **Phase 2 — Speculative decoding.** Draft-and-verify over the swarm — **done at
-  120B scale, ~18–25 tok/s exact over WAN** (see above).
+  GLM-5.2 744B scale, ~30 tok/s greedy over WAN** (and gpt-oss-120B at ~18–25, above).
 - **Phase 3 — Permissionless swarm.** One-command join, dynamic layer allocation
   across heterogeneous GPUs, per-token payouts, fault tolerance.
 
 Full detail, pass/fail criteria, and risks: [docs/ROADMAP.md](docs/ROADMAP.md).
-The WAN speculative-decoding design record: [docs/research/wan-speculative-decoding.md](docs/research/wan-speculative-decoding.md).
 
 ## License
 
