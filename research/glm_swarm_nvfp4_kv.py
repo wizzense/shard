@@ -141,6 +141,10 @@ class Layer:
         k_rot = k_rot.expand(b, self.nheads, s, self.qk_rope)
         Q = torch.cat([q_pass, q_rot], -1)                       # [b,h,s,qk_head]
         Knew = torch.cat([k_nope, k_rot], -1)                    # [b,h,s,qk_head]
+        # crop to start_pos first -> a verify at start_pos<len rolls back the prior round's
+        # rejected speculative tokens (spec-decode); a normal decode (start_pos==len) is a no-op.
+        if self.kc is not None and self.kc.shape[2] > start_pos:
+            self.kc = self.kc[:, :, :start_pos, :].contiguous(); self.vc = self.vc[:, :, :start_pos, :].contiguous()
         if self.kc is None: self.kc, self.vc = Knew, value
         else: self.kc = torch.cat([self.kc, Knew], 2); self.vc = torch.cat([self.vc, value], 2)
         total = self.kc.shape[2]
