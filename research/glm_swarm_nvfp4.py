@@ -19,6 +19,16 @@ from safetensors import safe_open
 from transformers import GlmMoeDsaConfig, AutoTokenizer
 from transformers.models.glm_moe_dsa import modeling_glm_moe_dsa as M
 
+# NVFP4 MoE kernel: we force the PRECOMPILED VLLM_CUTLASS backend (see _vllm_ctx, sets
+# kernel_config.moe_backend="cutlass"), so flashinfer's JIT (which OOM-kills/deadlocks on fresh
+# nodes) is never invoked. The no-op below is a belt-and-suspenders fallback, off by default.
+if os.environ.get("GLM_SKIP_FLASHINFER_BUILD", "0") == "1":
+    try:
+        import flashinfer.jit.core as _fijc
+        _fijc.JitSpec.build = lambda self, *a, **k: None
+    except Exception as _e:
+        print("warn: flashinfer build no-op patch failed:", _e, flush=True)
+
 DIR, dev = os.environ.get("GLM_DIR", "/root/glm52nvfp4"), "cuda"
 cfg = GlmMoeDsaConfig.from_pretrained(DIR); cfg._attn_implementation = "eager"
 H, E, I, Idense, K, eps = (cfg.hidden_size, cfg.n_routed_experts, cfg.moe_intermediate_size,
@@ -57,7 +67,16 @@ def _vllm_ctx():
     from vllm.v1.worker.workspace import init_workspace_manager
     torch.cuda.set_device(0)
     init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://", backend="nccl")
-    vcfg = VllmConfig(); _CTXMGR = set_current_vllm_config(vcfg); _CTXMGR.__enter__()
+    vcfg = VllmConfig()
+    # Force the precompiled VLLM_CUTLASS nvfp4 MoE kernel (in the wheel) instead of the default
+    # FLASHINFER_CUTLASS, which JIT-compiles fused_moe_120 and gets OOM-killed on fresh nodes.
+    try:
+        vcfg.kernel_config.moe_backend = "cutlass"
+    except Exception as e:
+        print("warn: could not set moe_backend=cutlass:", e, flush=True)
+    _CTXMGR = set_current_vllm_config(vcfg); _CTXMGR.__enter__()
+    from vllm.config import get_current_vllm_config
+    print(f"[cfg] moe_backend = {get_current_vllm_config().kernel_config.moe_backend}", flush=True)
     initialize_model_parallel(1); init_workspace_manager(torch.device("cuda"))
     _VC = vcfg; return vcfg
 
@@ -160,7 +179,13 @@ def stage(layer_ids, port, nxt=None):
     vcfg = _vllm_ctx()
     layers = [load_layer(i) for i in layer_ids]
     mem = torch.cuda.memory_allocated() / 1e9
-    print(f"stage layers {layer_ids} loaded ({mem:.1f} GB) listening :{port}" +
+    # WARMUP: trigger flashinfer/cutlass JIT now (first forward compiles on CPU, GPU idle ~1-2min)
+    # so "listening" means truly ready and the first real token isn't cold.
+    print(f"stage layers {layer_ids} loaded ({mem:.1f} GB) — warming up (JIT)...", flush=True)
+    with torch.no_grad():
+        _ = run_block(layers, torch.randn(1, 8, H, dtype=torch.bfloat16, device=dev) * 0.1, vcfg)
+    torch.cuda.synchronize()
+    print(f"stage layers {layer_ids} WARM, listening :{port}" +
           (f" -> {nxt}" if nxt else " (tail->return)"), flush=True)
     srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("0.0.0.0", port)); srv.listen(4)
@@ -188,7 +213,8 @@ def coord(stage_ep, prompt, max_new):
     lm_head_w = raw("lm_head.weight").to(torch.bfloat16).to(dev)
     norm_w = raw("model.norm.weight").float().to(dev)
     host, p = stage_ep.rsplit(":", 1)
-    s = socket.create_connection((host, int(p)), timeout=120); s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    s = socket.create_connection((host, int(p)), timeout=300); s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    s.settimeout(300)
     print(f"coord -> stage chain @ {stage_ep}", flush=True)
     ids = tok(prompt, return_tensors="pt").input_ids.to(dev)
     eos = cfg.eos_token_id if isinstance(cfg.eos_token_id, list) else [cfg.eos_token_id]

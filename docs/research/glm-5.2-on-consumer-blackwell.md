@@ -84,3 +84,51 @@ overflow entirely. (Separately, stock vLLM/SGLang sm_120 DSA support is maturing
   execution** as the c0mpute-native serving path for GLM-5.2 on consumer Blackwell; table
   stock-vLLM-TP serving (doesn't fit per-GPU on 32 GB cards) and watch the sm_120 DSA
   ecosystem. gpt-oss-120B (18–25 tok/s over WAN) remains the shipped headline meanwhile.
+
+## NVFP4 swarm driver — validated end to end over real WAN (2026-06-18)
+
+`research/glm_swarm_nvfp4.py`: the NVFP4 port of the PP driver (coord + multi-layer stage +
+`--next` chain + TCP transport). Handles dense layers 0–2 (1-expert FusedMoE) and MoE layers
+3–77 (256-expert routed + 1-expert shared). Validated **coord (Washington 5090) → stage (Texas
+5090) over the open internet**: hidden states cross machines, output flows, **4.95 tok/s** for a
+2-layer stage. Per-node bootstrap is just `pip install -r phase0/requirements_vmoe.txt` (all stock
+PyPI, ~1 min) + `phase0/node_fetch.py` (selective per-node layer download).
+
+**Critical kernel finding — force `VLLM_CUTLASS`, not flashinfer.** vLLM defaults the NVFP4 MoE to
+`FLASHINFER_CUTLASS`, which **JIT-compiles** `fused_moe_120` (cutlass) on first forward. On fresh
+nodes that compile **OOM-kills** (35 parallel `cicc`) or **deadlocks** on stale ninja locks — it
+only "works" on a box that compiled it once and cached the `.so`. Fix: set
+`vllm_config.kernel_config.moe_backend = "cutlass"` → the **precompiled `VLLM_CUTLASS`** kernel in
+the wheel runs with **zero JIT, zero OOM**, warms in seconds. (Also: never `pkill -f glm_swarm` in a
+command that launches it — self-kills the SSH shell; reap GPU procs via `nvidia-smi … | xargs kill`.)
+Parallel launcher: `phase0/launch_swarm.py` (provision → bootstrap → mesh RTT → `shard/topology`
+ordering → layer assignment → chained stages → coord → tok/s).
+
+## Hardware pivot: 20× scattered 5090 → ~5–6× scattered RTX PRO 6000 (2026-06-18)
+
+A PP WAN swarm is **hop-limited**: per-token latency ≈ (entry + Σ forward hops + return) × RTT, and
+hop count = ⌈model_size / usable_VRAM_per_node⌉. For GLM-5.2-NVFP4 (~410 GB):
+- **32 GB RTX 5090** → ~4 NVFP4 layers/node → **~20 nodes → ~20 hops** → naive ~0.3–1 tok/s; even
+  with KV cache + spec-decode the 20-hop floor caps it ~10–13 tok/s (code). Orchestrating 20
+  simultaneously-online consumer GPUs is also fragile.
+- **96 GB RTX PRO 6000 Blackwell** (sm_120 — *same arch as the 5090, our NVFP4/VLLM_CUTLASS code
+  runs unchanged*) → ~16 NVFP4 layers/node → **~5 nodes → ~5 hops**.
+
+**Decision (with leyten, 2026-06-18): pivot to ~5–6 scattered RTX PRO 6000 workstations.** Why:
+1. **tok/s ∝ 1/hops** → ~4× fewer hops is a ~4× win *before* spec-decode, compounding with the g×
+   from GLM-5.2's native MTP draft head. Projected: naive ~3 tok/s; +KV-cache +MTP-spec-decode
+   **~15 tok/s chat / ~30–40 tok/s code over WAN.**
+2. **Cheaper total**: ~5 × $0.97 ≈ **$5/hr** vs ~20 × $0.45 ≈ $9/hr.
+3. **Zero code changes** — RTX PRO 6000 is Blackwell sm_120; the nvfp4 cutlass path is identical.
+4. **More realistic node population**: a handful of prosumer ML workstations in different cities is
+   far more plausible (and stable) than 20 coordinated consumer 5090s online at once.
+5. **Still the scattered thesis** — non-colocated workstations across US cities over WAN, NOT a
+   datacenter rack; topology + the shortest-loop optimization still earn their keep at ~5 hops.
+   vast supply: 13+ distinct US RTX PRO 6000 WS at ~$0.94–1.2/hr.
+
+**Next: make KV cache + MTP speculative decoding as good as possible** (target 30–40 tok/s code over
+WAN). KV cache = MLA compressed latent per stage (kills the O(n²) recompute + shrinks the wire to one
+token/step). Spec-decode = port `phase0/specpipe.py` + `phase0/tree.py` (already built for gpt-oss)
+onto GLM-5.2's native MTP head — draft K tokens coord-side, verify all in ONE chain traversal (one
+WAN round-trip commits g+1 tokens). Greedy acceptance → output token-identical to plain decode (free
+correctness oracle for the proof). Direct tail→coord return (vs relay-back) halves the loop.
