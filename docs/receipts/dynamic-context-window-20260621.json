@@ -1,0 +1,56 @@
+{
+  "run_id": "dynamic-context-window-20260621",
+  "utc": "2026-06-21",
+  "model": "gpt-oss-120b (mxfp4)",
+  "what": "Dynamic decode context (bucketed KV read) + sliding-window KV read for the fast-verify path. Single-box microbench isolates the decode-cost wins; live 3x scattered-4090 swarm confirms the engine + a clean tok/s baseline on today's links.",
+  "swarm": "3 scattered RTX 4090 stages over WAN (CA head -> WA -> NC tail) + layerless coord/draft (Utah); mesh-optimal ring loop 185 ms",
+
+  "1_dynamic_context_bucketing": {
+    "change": "StaticKV.update returns k/v[:, :, :alen] where alen = smallest DECODE_BUCKET >= current ctx (2048,4096,8192,...), not maxlen. The dropped tail is unwritten/causal-masked, so the read is a PREFIX -> BIT-IDENTICAL to the full-buffer read (same matmul tiling + trailing exact-zeros).",
+    "bit_exact": true,
+    "microbench_ms_per_step_short_ctx_~200_one_6layer_stage": {
+      "bucketed_max_ctx_2048": 3.53,
+      "bucketed_max_ctx_8192": 3.51,
+      "bucketed_max_ctx_32768": 3.50,
+      "bucketed_max_ctx_65536": 3.42,
+      "FULL_old_max_ctx_8192": 5.53,
+      "FULL_old_max_ctx_32768": 13.57,
+      "FULL_old_max_ctx_65536": 24.87,
+      "verdict": "decode cost is now FLAT in the ceiling (set by live ctx, not max_ctx). Old behavior grew with max_ctx: a short prompt under a 64k ceiling cost 24.87 ms/step; bucketed costs 3.42 -> ~7.3x. The 'pay-for-your-ceiling' tax is gone, bit-exactly."
+    }
+  },
+
+  "2_sliding_window_kv_read": {
+    "change": "gpt-oss alternates full-attention and sliding-window(128) layers. In window_mode the sliding layers index_select ONLY the wlen=win+kp1-1 keys their window can attend (a fixed-length, graph-capturable gather), instead of reading the full bucket and masking. O(window) not O(ctx).",
+    "correctness": "math proven bit-exact in isolation (max|full-window|=0.0; identical absolute positions attended). In the full model it is NUMERICALLY equivalent but NOT bit-identical: the shifted gather re-tiles the AV matmul -> ~few-ULP FP non-associativity (layer 0/2 bit-identical, layer 4 ~4 ULP) that MoE expert-routing amplifies over autoregressive steps (same class as the documented cross-K FP non-determinism; each output is a valid greedy decode).",
+    "bit_exact": false,
+    "default": "OFF (FV_WINDOW=1 to opt in per node) -- keeps the default engine bit-exact",
+    "microbench_ms_per_step_one_6layer_stage_3sliding": {
+      "ctx_4000_full": 6.11, "ctx_4000_window": 5.03, "speedup_4000": 1.21,
+      "ctx_8000_full": 5.61, "ctx_8000_window": 4.30, "speedup_8000": 1.31,
+      "ctx_12000_full": 8.35, "ctx_12000_window": 5.81, "speedup_12000": 1.44,
+      "note": "speedup grows with ctx; only the sliding half of layers benefit, MoE/MLP cost unchanged -> approaches its asymptote at longer ctx"
+    }
+  },
+
+  "3_swarm_runs": {
+    "baseline_max_ctx_2048": {
+      "tok_s": {"SYNC_warm": 21.33, "PIPE_d2_warm": 22.76, "PIPE_d4_warm": 24.29},
+      "accept": "2.93-3.14 tok/traversal", "recv_ms": "~103", "coherent": true
+    },
+    "rerun_max_ctx_8192_4x_ceiling": {
+      "tok_s": {"SYNC_warm": 20.85, "PIPE_d4_warm": 27.63, "PIPE_d8_warm": 27.15},
+      "accept": "3.04 tok/traversal", "recv_ms": "~94", "coherent": true,
+      "verdict": "a 4x larger context ceiling (8192 vs 2048) cost NOTHING -> 27.63 tok/s, >= the 2048 baseline. This is the dynamic-context win end-to-end: the ceiling no longer taxes decode. Old (non-bucketed) code at max_ctx=8192 reads 8192 keys/step (microbench 5.53 vs 3.51 ms/step). depth=4 is the sweet spot; depth=8 over-fills (+56 stale, no gain)."
+    },
+    "regime_note": "lower than the ~40 receipt because today's links give a 185 ms ring loop vs the receipt's in-region 102 ms (recv ~90-160 ms dominates). At short ctx the swarm is WAN-latency-bound: per-step decode (~3.5 ms) << ring recv (~100 ms). So the decode-compute wins move LONG-context tok/s and remove the max_ctx tax, not the short-ctx WAN-bound number. The ~24->28 band across runs is WAN variance, not the bucketing."
+  },
+
+  "files": [
+    "phase0/fastverify.py (DECODE_BUCKETS bucketing; StaticKV window read; FV_WINDOW gate)",
+    "research/fastverify_window.py (bit-exact / deviation characterization)",
+    "research/fastverify_bench.py (decode-cost microbench)",
+    "research/iso_mask.py + research/fv_layerdiff.py (root-causing the window FP non-associativity)"
+  ],
+  "honest_status": "Dynamic context (bucketing) is a clean, bit-exact, always-on win: decode cost no longer scales with the ceiling. Sliding-window read is a 1.2-1.44x long-ctx decode lever, numerically-equivalent but not bit-identical (opt-in). On WAN-bound links the end-to-end short-ctx tok/s is set by ring latency, so these are long-context / memory-wall wins."
+}

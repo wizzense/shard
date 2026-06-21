@@ -51,11 +51,20 @@ def instances():
     d = vast_json(["show", "instances-v1"]) or []
     return d if isinstance(d, list) else d.get("instances", [])
 
+def _ep(inst):
+    """direct SSH endpoint (public_ipaddr + mapped-22) — the --direct path; falls back to proxy."""
+    port22 = (inst.get("ports") or {}).get("22/tcp")
+    if port22 and inst.get("public_ipaddr"):
+        return inst["public_ipaddr"], port22[0]["HostPort"]
+    return inst["ssh_host"], inst["ssh_port"]
+
 def node_ssh(inst):
-    return ["ssh", "-i", KEY, "-p", str(inst["ssh_port"])] + SSHO + [f"root@{inst['ssh_host']}"]
+    host, port = _ep(inst)
+    return ["ssh", "-i", KEY, "-p", str(port)] + SSHO + [f"root@{host}"]
 
 def node_scp(inst, files, dest="/root/"):
-    return ["scp", "-i", KEY, "-P", str(inst["ssh_port"])] + SSHO + files + [f"root@{inst['ssh_host']}:{dest}"]
+    host, port = _ep(inst)
+    return ["scp", "-i", KEY, "-P", str(port)] + SSHO + files + [f"root@{host}:{dest}"]
 
 def rssh(inst, remote_cmd, timeout=120):
     return sh(node_ssh(inst) + [remote_cmd], timeout)
@@ -78,7 +87,8 @@ def wait_running(ids, timeout=600):
 
 # ---------- 2. bootstrap ----------
 def bootstrap(inst):
-    files = [f"{HERE}/requirements_vmoe.txt", f"{HERE}/node_fetch.py", f"{REPO}/research/glm_swarm_nvfp4.py"]
+    files = [f"{HERE}/requirements_vmoe.txt", f"{HERE}/node_fetch.py",
+             f"{REPO}/research/glm_swarm_nvfp4.py", f"{REPO}/research/glm_swarm_nvfp4_kv.py"]
     sh(node_scp(inst, files), 180)
     # idempotent: build venv only if missing; flashinfer compiles at first stage warmup (MAX_JOBS capped)
     cmd = ("test -x /root/vmoe/bin/python || (python3 -m venv /root/vmoe && "
@@ -204,7 +214,7 @@ def main():
         # No MAX_JOBS / no compile: VLLM_CUTLASS is precompiled (moe_backend=cutlass in the driver).
         cmd = (f"nvidia-smi --query-compute-apps=pid --format=csv,noheader|xargs -r kill -9 2>/dev/null; fuser -k {STAGE_PORT}/tcp 2>/dev/null; sleep 2; "
                f"rm -f /root/stage.log; cd /root && . /root/vmoe/bin/activate && "
-               f"setsid bash -c 'python glm_swarm_nvfp4.py stage --layers {' '.join(map(str,blk))} --port {STAGE_PORT}{nextarg} > /root/stage.log 2>&1' </dev/null >/dev/null 2>&1 &")
+               f"setsid bash -c 'python glm_swarm_nvfp4_kv.py stage --layers {' '.join(map(str,blk))} --port {STAGE_PORT}{nextarg} > /root/stage.log 2>&1' </dev/null >/dev/null 2>&1 &")
         rssh(inst, cmd, 60)
         return inst["id"]
     for idx in range(len(chain)): launch(idx)
@@ -226,7 +236,7 @@ def main():
     print("[8] coord -> generate -> tok/s...", flush=True)
     s0 = eps[0][1]
     ccmd = (f"cd /root && . /root/vmoe/bin/activate && "
-            f"python glm_swarm_nvfp4.py coord --stage {s0} --prompt \"{a.prompt}\" --max-new {a.max_new} 2>&1 | "
+            f"python glm_swarm_nvfp4_kv.py coord --stage {s0} --prompt \"{a.prompt}\" --max-new {a.max_new} 2>&1 | "
             f"grep -viE 'INFO |WARNING|modelopt|FutureWarning|warnings.warn'")
     rc, out, err = rssh(coord, ccmd, 1800)
     print(out[-1500:], flush=True)

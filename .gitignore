@@ -26,3 +26,7 @@ RESULT_spec.txt
 RESULTS.md
 SWARM_DEPLOY_STATE.md
 RESUME_B.md
+
+# transport secret — never commit
+.shard_psk
+*.psk

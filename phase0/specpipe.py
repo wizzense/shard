@@ -164,6 +164,12 @@ def serve_spec_fast(parts, stage, nstages, listen_port, nxt, timeout, dev, direc
     fv = FastVerify(parts, maxlen=max_ctx, dev=dev)
     print(f"[s{stage}] listening on :{listen_port} (FAST verify, max_ctx={max_ctx}, edge timeout {timeout:.0f}s)", flush=True)
     while True:
+        if not is_tail and nxt_sock is None:                 # forward link dropped (coordinator churn) -> rebuild it;
+            for _ in range(60):                              # closing it made the NEXT stage drop its link too, so the
+                try:                                         # whole ring re-handshakes fresh and a new coordinator can drive it
+                    nxt_sock = socket.socket(); nxt_sock.settimeout(timeout); nxt_sock.connect((host, int(port))); break
+                except OSError: time.sleep(0.5)
+            print(f"[s{stage}] forward link rebuilt -> {nxt}" if nxt_sock else f"[s{stage}] relink FAILED", flush=True)
         conn, addr = srv.accept(); conn.settimeout(timeout)
         print(f"[s{stage}] stage {stage-1} connected from {addr}", flush=True)
         fv.reset(); first = True; verifies = 0
@@ -205,76 +211,101 @@ def serve_spec_fast(parts, stage, nstages, listen_port, nxt, timeout, dev, direc
                     print(f"[s{stage}] edge {why} after {verifies} verifies ({type(e).__name__}); resetting", flush=True)
                     try: conn.close()
                     except OSError: pass
+                    if nxt_sock is not None:                  # drop forward link -> ring re-handshakes fresh on re-accept
+                        try: nxt_sock.close()
+                        except OSError: pass
+                        nxt_sock = None
                     break
                 except Exception as e:                       # survive a bad message instead of dying
                     k = list(msg.keys()) if isinstance(msg, dict) else "?"
                     print(f"[s{stage}] bad msg after {verifies} verifies ({type(e).__name__}: {str(e)[:80]} keys={k}); resetting", flush=True)
                     try: conn.close()
                     except OSError: pass
+                    if nxt_sock is not None:
+                        try: nxt_sock.close()
+                        except OSError: pass
+                        nxt_sock = None
                     break
 
 
 def serve_tail_fast(parts, listen_port, timeout, dev, max_ctx=2048):
-    """direct-return tail with the FAST verify (see serve_spec_fast + serve_tail_direct)."""
-    import select
+    """direct-return tail, RESILIENT to coordinator churn. the predecessor (the ring's
+    forward chain) and the coordinator-return channel have INDEPENDENT lifecycles:
+      - return channel drops (coordinator restart / gateway reconnect / retry) -> keep
+        the predecessor + KV, re-accept a new return channel. the ring is NOT poisoned.
+      - predecessor drops (an upstream stage reconnected) -> re-accept it, keep the return.
+    a connection is identified by CONTENT: the coordinator sends {"op":"hello_return"} on
+    its return channel; anything else is the predecessor (and its first message is queued).
+    this is what lets the gateway connect, fail, retry, and restart without relaunching the
+    swarm -- the c0mpute come-and-go property at the tail."""
     srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("0.0.0.0", listen_port)); srv.listen(2)
+    srv.bind(("0.0.0.0", listen_port)); srv.listen(8)
     fv = FastVerify(parts, maxlen=max_ctx, dev=dev)
     print(f"[tail] listening on :{listen_port} (FAST verify, max_ctx={max_ctx}, direct return, edge timeout {timeout:.0f}s)", flush=True)
-    while True:
-        c1, _ = srv.accept(); c2, _ = srv.accept()
-        ready, _, _ = select.select([c1, c2], [], [], timeout)
-        if not ready:
-            c1.close(); c2.close(); continue
-        # identify the return channel by CONTENT, not arrival order: the coordinator
-        # sends {"op":"hello_return"} on it. Over some transports (e.g. the libp2p
-        # sidecar) the predecessor's first forward message can race ahead of the hello,
-        # so the first-readable conn may be the predecessor — handle either order.
-        try:
-            first_conn = ready[0]
-            m0 = recv_msg(first_conn)
-            if isinstance(m0, dict) and m0.get("op") == "hello_return":
-                ret_conn = first_conn; pred_conn = c2 if first_conn is c1 else c1
+    pred = ret = None; pending = None; first = True
+
+    def fill():                                            # block until BOTH channels are present
+        nonlocal pred, ret, pending
+        while pred is None or ret is None:
+            c, _ = srv.accept()
+            try:
+                m = recv_msg(c)
+            except EDGE_ERRORS:
+                try: c.close()
+                except OSError: pass
+                continue
+            if isinstance(m, dict) and m.get("op") == "hello_return":
+                if ret is not None:
+                    try: ret.close()
+                    except OSError: pass
+                ret = c; print("[tail] coordinator-return (re)connected", flush=True)
+            else:                                          # predecessor: its first msg is real, queue it
+                if pred is not None:
+                    try: pred.close()
+                    except OSError: pass
+                pred = c; pred.settimeout(timeout); pending = m
+                print("[tail] predecessor (re)connected", flush=True)
+
+    with torch.no_grad():
+        while True:
+            fill()
+            try:
+                msg = pending if pending is not None else recv_msg(pred)
                 pending = None
-            else:                                  # first_conn is the predecessor; m0 is a real msg
-                pred_conn = first_conn; ret_conn = c2 if first_conn is c1 else c1
-                hello = recv_msg(ret_conn)
-                if not (isinstance(hello, dict) and hello.get("op") == "hello_return"):
-                    c1.close(); c2.close(); continue
-                pending = m0
-        except EDGE_ERRORS:
-            c1.close(); c2.close(); continue
-        pred_conn.settimeout(timeout)
-        print("[tail] predecessor + coordinator-return connected", flush=True)
-        fv.reset(); first = True; verifies = 0
-        with torch.no_grad():
-            while True:
-                try:
-                    msg = pending if pending is not None else recv_msg(pred_conn)
-                    pending = None
-                    if msg["op"] == "reset":
-                        fv.reset(); first = True; send_msg(ret_conn, "ok"); continue
-                    g = msg.get("gather")
-                    if g:
-                        fv.tree_gather(g[0], g[1])
-                    x = msg["h"].to(dev)
-                    if "par" in msg:                       # TREE verify
-                        h = fv.tree_decode(x, msg["start"], msg["par"], msg["dep"])
-                    else:
-                        h = fv.prefill(x, msg["start"]) if (first or msg.get("prefill")) else fv.decode(x, msg["start"]); first = False
-                    h = parts["norm"](h)
-                    send_msg(ret_conn, parts["lm_head"](h).argmax(-1)[0].tolist()); verifies += 1
-                except EDGE_ERRORS as e:
-                    print(f"[tail] edge after {verifies} verifies ({type(e).__name__}); resetting", flush=True)
-                    try: pred_conn.close(); ret_conn.close()
-                    except OSError: pass
-                    break
-                except Exception as e:                       # survive a bad message instead of dying
-                    k = list(msg.keys()) if isinstance(msg, dict) else "?"
-                    print(f"[tail] bad msg after {verifies} verifies ({type(e).__name__}: {str(e)[:80]} keys={k}); resetting", flush=True)
-                    try: pred_conn.close(); ret_conn.close()
-                    except OSError: pass
-                    break
+            except EDGE_ERRORS as e:                       # predecessor gone -> usually a coordinator churn, which
+                print(f"[tail] predecessor edge ({type(e).__name__}); re-accepting predecessor + return", flush=True)
+                try: pred.close()
+                except OSError: pass
+                pred = None
+                if ret is not None:                        # ALSO drop the return channel: the new coordinator brings a
+                    try: ret.close()                       # fresh return channel, so the reset's 'ok' must not be sent to
+                    except OSError: pass                   # the dead old one (the race that made churn recovery flaky)
+                    ret = None
+                continue
+            try:
+                if msg["op"] == "reset":
+                    fv.reset(); first = True; send_msg(ret, "ok"); continue
+                g = msg.get("gather")
+                if g:
+                    fv.tree_gather(g[0], g[1])
+                x = msg["h"].to(dev)
+                if "par" in msg:                           # TREE verify
+                    h = fv.tree_decode(x, msg["start"], msg["par"], msg["dep"])
+                else:
+                    h = fv.prefill(x, msg["start"]) if (first or msg.get("prefill")) else fv.decode(x, msg["start"]); first = False
+                h = parts["norm"](h)
+                send_msg(ret, parts["lm_head"](h).argmax(-1)[0].tolist())
+            except EDGE_ERRORS as e:                        # return channel gone -> re-accept it, keep pred + KV
+                print(f"[tail] return edge ({type(e).__name__}); dropping return channel, keeping predecessor+KV", flush=True)
+                try: ret.close()
+                except OSError: pass
+                ret = None; continue
+            except Exception as e:                          # bad message -> drop the return channel, survive
+                k = list(msg.keys()) if isinstance(msg, dict) else "?"
+                print(f"[tail] bad msg ({type(e).__name__}: {str(e)[:80]} keys={k}); dropping return channel", flush=True)
+                try: ret.close()
+                except OSError: pass
+                ret = None; continue
 
 
 def generate_spec(draft, parts, tok, sock, prompt, K, max_new, dev, draft_dev, timeout,
@@ -453,7 +484,8 @@ def coordinate(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout,
 
 
 def coordinate_pipe(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout, depth, ret_sock=None,
-                    ignore_eos=False, prefill_chunk=0, draft_ctx=0):
+                    ignore_eos=False, prefill_chunk=0, draft_ctx=0, on_commit=None, reasoning=None, system=None,
+                    max_ctx=0):
     """PIPELINED coordinator: keep `depth` verify chunks in flight over the ring, so
     throughput approaches the ring's per-chunk THROUGHPUT, not its full latency (the
     GLM-pipe lever, on the gpt-oss fast-verify path). Same K+1-token chunk as the
@@ -465,9 +497,12 @@ def coordinate_pipe(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout, dep
     pipe_sock.settimeout(timeout)
     rx = ret_sock if ret_sock is not None else pipe_sock
     eos = tok.eos_token_id
-    enc = tok.apply_chat_template([{"role": "user", "content": prompt}],
-                                  add_generation_prompt=True, return_tensors="pt", return_dict=True)
+    ct_kw = {"reasoning_effort": reasoning} if reasoning else {}   # gpt-oss: 'low' -> terse analysis, more budget for the answer
+    msgs = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prompt}]
+    enc = tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt", return_dict=True, **ct_kw)
     prompt_ids = enc["input_ids"][0].tolist()
+    if max_ctx:                                                   # never let prompt+generation exceed the window
+        max_new = max(16, min(max_new, max_ctx - len(prompt_ids) - 16))
     out = []
     t_draft = t_recv = 0.0
     try:
@@ -485,6 +520,7 @@ def coordinate_pipe(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout, dep
             cur = recv_msg(rx)[-1]
         pos = len(prompt_ids)
         out = [cur]
+        if on_commit: on_commit({"phase": "prefilled", "prompt_tokens": len(prompt_ids)})
         inflight = []                              # FIFO of (start_pos, drafts) sent but not yet read
         discard = 0                                # stale post-divergence results still to drain
         send_pos = pos                             # absolute pos where the next chunk writes
@@ -526,6 +562,7 @@ def coordinate_pipe(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout, dep
                 recv_msg(draft_sock)                                   # outstanding draft is stale -> drop it
                 dprefix = prompt_ids + out; send_pos = pos             # re-draft from the corrected prefix
                 send_msg(draft_sock, {"ids": dq(), "k": K})           # re-prime from the corrected prefix
+            if on_commit: on_commit({"phase": "decode", "out": out, "dt": time.time() - t0})
             if len(out) >= max_new or (not ignore_eos and (cur == eos or eos in committed)):
                 done = True
         recv_msg(draft_sock)                                          # drain the outstanding draft request

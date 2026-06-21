@@ -11,10 +11,11 @@ Flow: eps -> launch tail-first (stage3=tail, stage0=served-head; all --fast --di
       -> draft_server (vLLM gpt-oss-20b) on coord -> warm barrier -> coord SYNC sweep, PIPE sweep.
 Teardown is manual (vastai stop/destroy). Stage order is taken as given (fixed across both runs).
 """
-import sys, json, time, subprocess, argparse, concurrent.futures as cf
+import os, sys, json, time, subprocess, argparse, concurrent.futures as cf
 
 KEY = "/root/.ssh/vast_c0mpute"
-PSK = "REMOVED-ROTATED-SECRET"
+# transport secret — NEVER hardcode (this file is in a public repo). Read from env or ~/.shard_psk (gitignored).
+PSK = (os.environ.get("SHARD_PSK") or open(os.path.expanduser("~/.shard_psk")).read().strip())
 PORT = 29600
 DRAFT_PORT = 8200
 M120 = "/root/models/gpt-oss-120b"
@@ -73,7 +74,7 @@ def launch_stage(inst, stage, nstages, nxt_ep, served_head, max_ctx=2048):
            f"fuser -k {PORT}/tcp 2>/dev/null; sleep 2; rm -f /root/stage.log; cd /root && "
            f"SHARD_PSK={PSK} setsid bash -c 'python3 specpipe.py --stage {stage} --nstages {nstages} "
            f"--model {M120} --listen-port {PORT}{nextarg}{head} --fast --direct-return "
-           f"--max-ctx {max_ctx} --timeout 300 > /root/stage.log 2>&1' </dev/null >/dev/null 2>&1 &")
+           f"--max-ctx {max_ctx} --timeout 600 > /root/stage.log 2>&1' </dev/null >/dev/null 2>&1 &")
     fire(inst, cmd)
 
 
@@ -102,6 +103,13 @@ def main():
     ap.add_argument("--tree", default="", help="run FAST graphed tree spec 'w,d' instead of the linear compare")
     ap.add_argument("--dump", action="store_true", help="write the warm run (ids+hash+sync-match) to /root/run.json for the receipt")
     ap.add_argument("--skip-draft", action="store_true", help="reuse a draft already running on coord")
+    ap.add_argument("--gateway", action="store_true", help="after warm, launch the streaming gateway on the coord "
+                    "as the sole coordinator (persisted via the same setsid/fire path as the draft) and write "
+                    "nodes.json from the live topology; implies no self-test run.")
+    ap.add_argument("--no-run", action="store_true", help="launch+warm stages and draft, then STOP (no self-test "
+                    "coordinator). leaves the ring fresh so an external coordinator (e.g. the gateway) is the first "
+                    "session -- the forward links are set once at launch and don't reconnect, so a self-test would "
+                    "poison the ring for the next coordinator.")
     ap.add_argument("--max-ctx", type=int, default=2048, help="fast-verify static cache size (prompt+gen ceiling)")
     a = ap.parse_args()
 
@@ -110,6 +118,7 @@ def main():
     insts = instances()
     coord = insts[a.coord]
     stages = [insts[i] for i in sids]
+    hops_ms, loop_ms = [], 0                         # measured per-hop RTT + loop, surfaced on the demo map
     try:                                            # RTT-optimal stage order: minimize coord->s0->..->sN->coord
         import itertools, launch_swarm
         alln = [coord] + stages
@@ -122,7 +131,10 @@ def main():
                 best, border = c, perm
         if best is not None and best < 9000:        # all hops probed (9999 = a failed probe)
             stages = [alln[i] for i in border]
-            print(f"[mesh] optimal loop {best:.0f}ms; order {[s.get('geolocation') for s in stages]}", flush=True)
+            loop_ms = int(best)
+            o = list(border)                        # ring edges coord->s0->..->sN->coord, real measured RTT each
+            hops_ms = [int(M[0][o[0]])] + [int(M[o[i]][o[i + 1]]) for i in range(len(o) - 1)] + [int(M[o[-1]][0])]
+            print(f"[mesh] optimal loop {best:.0f}ms; order {[s.get('geolocation') for s in stages]}; hops {hops_ms}", flush=True)
         else:
             print("[mesh] probe inconclusive; keeping given order", flush=True)
     except Exception as e:
@@ -142,7 +154,7 @@ def main():
                     f"fuser -k {DRAFT_PORT}/tcp 2>/dev/null; sleep 2; rm -f /root/draft.log; cd /root && "
                     f"SHARD_PSK={PSK} CUDA_VISIBLE_DEVICES=0 setsid bash -c "
                     f"'/root/vllmenv/bin/python draft_server.py --model {M20} --port {DRAFT_PORT} "
-                    f"--max-len {a.max_ctx} > /root/draft.log 2>&1' </dev/null >/dev/null 2>&1 &")
+                    f"--max-len {min(a.max_ctx, 8192)} > /root/draft.log 2>&1' </dev/null >/dev/null 2>&1 &")
 
     print("[launch] stages tail-first; wait each to listen before launching its predecessor "
           "(120B partial load ~1-2min/node, so a predecessor never connects to a dead successor)...", flush=True)
@@ -165,9 +177,61 @@ def main():
 
     head_ep = f"{eps[0][0]}:{eps[0][1]}"
     tail_ep = f"{eps[nstages-1][0]}:{eps[nstages-1][1]}"
+
+    if a.gateway:
+        # launch the streaming gateway on the coord, as the FIRST (sole) coordinator on the
+        # fresh ring, via the SAME fire()/setsid path that persists the draft+stages (a plain
+        # ssh-backgrounded process gets reaped when the ssh session closes on these boxes).
+        # write nodes.json from the live topology so the map shows the real ring.
+        LATLON = {"California": (37.4, -122.0), "North Carolina": (35.5, -79.0),
+                  "Washington": (47.4, -120.5), "Utah": (39.3, -111.7), "Oregon": (44.0, -120.5),
+                  "Texas": (31.0, -99.0), "New York": (43.0, -75.0), "Virginia": (37.5, -78.5)}
+        seen = {}
+        def latlon(geo):
+            st = (geo or "").split(",")[0].strip()
+            base = LATLON.get(st, (39.0, -98.0))
+            k = seen.get(st, 0); seen[st] = k + 1            # nudge duplicates so they don't overlap on the map
+            return (base[0] + 0.0, base[1] + 3.0 * k)
+        nodes = []
+        span = 36 // nstages
+        for k, s in enumerate(stages):
+            la, lo = latlon(s.get("geolocation"))
+            role = "head" if k == 0 else ("tail" if k == nstages - 1 else "mid")
+            nodes.append({"idx": k, "city": (s.get("geolocation") or "US").split(",")[0],
+                          "lat": la, "lon": lo, "layers": f"{k*span}-{(k+1)*span}", "role": role,
+                          "ip": ep(s)[0]})                    # real public IP — verifiable on the map
+        cla, clo = latlon(coord.get("geolocation"))
+        nodes.append({"idx": 99, "city": (coord.get("geolocation") or "Utah").split(",")[0],
+                      "lat": cla, "lon": clo, "layers": "draft", "role": "coord", "ip": ep(coord)[0]})
+        import json as _json
+        nodes_json = _json.dumps({"nodes": nodes, "hops": hops_ms, "loop_ms": loop_ms}).replace("'", "")
+        rssh(coord, f"cat > /root/nodes.json <<'NODESEOF'\n{nodes_json}\nNODESEOF", 20)
+        print(f"\n[gateway] launching on coord:29600 (sole coordinator) head={head_ep} tail={tail_ep}", flush=True)
+        fire(coord, f"fuser -k 29600/tcp 2>/dev/null; sleep 2; rm -f /root/gateway.log; "
+                    f"cd /root && SHARD_PSK={PSK} setsid bash -c 'exec python3 -u gateway.py --head {head_ep} "
+                    f"--tail {tail_ep} --draft 127.0.0.1:{DRAFT_PORT} --port 29600 --max-new 4096 "
+                    f"--max-ctx {a.max_ctx} "
+                    f"--nodes-file /root/nodes.json > /root/gateway.log 2>&1' </dev/null >/dev/null 2>&1 &")
+        for _ in range(30):                                  # wait for the gateway to bind (torch import ~15-20s)
+            r = rssh(coord, "ss -ltnp 2>/dev/null | grep -c :29600", 20)
+            if r.stdout.strip().startswith("1"):
+                print("[gateway] UP on :29600 (proxied to shard.c0mpute.ai); first request warms the cold flex compile", flush=True)
+                break
+            time.sleep(3)
+        else:
+            print("[gateway] did NOT bind:", rssh(coord, "tail -5 /root/gateway.log", 20).stdout[-400:], flush=True)
+        print("[done] stages + gateway warm; teardown: vastai destroy instance <id>", flush=True)
+        return
+
+    if a.no_run:
+        print(f"\n[ready] ring warm, no self-test run.  HEAD={head_ep}  TAIL={tail_ep}", flush=True)
+        print(f"[ready] point the gateway here:  --head {head_ep} --tail {tail_ep} --draft 127.0.0.1:{DRAFT_PORT}", flush=True)
+        print("[done] stages still warm; teardown: vastai destroy instance <id>", flush=True)
+        return
+
     base = (f"cd /root && SHARD_PSK={PSK} python3 specpipe.py --coordinator --nstages {nstages} "
             f"--model {M20} --draft-server 127.0.0.1:{DRAFT_PORT} --next {head_ep} "
-            f"--direct-return --tail {tail_ep} --prompt \"{a.prompt}\" --max-new {a.max_new} --timeout 300")
+            f"--direct-return --tail {tail_ep} --prompt \"{a.prompt}\" --max-new {a.max_new} --timeout 600")
 
     if a.tree:
         print(f"\n[run] === FAST TREE spec (w,d={a.tree}), cold+warm ===", flush=True)
