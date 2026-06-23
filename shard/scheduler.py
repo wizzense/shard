@@ -18,6 +18,31 @@ class JoinedNode:
     rtt_ms: dict  # node_id -> measured rtt to other nodes
 
 
+def _distribute(total: int, caps: list[tuple[str, int]]) -> dict[str, int]:
+    """Hand out `total` layers across nodes proportional to their layer capacity, never
+    exceeding a node's cap, summing to exactly `total`. Largest-remainder rounding, then the
+    leftover (from capped/rounded nodes) is pushed onto the nodes with the most spare capacity
+    (fat nodes first). Caller pre-checks sum(cap) >= total, so this always closes."""
+    ids = [i for i, _ in caps]
+    cap = dict(caps)
+    capsum = sum(cap.values())
+    base = {i: min(cap[i], (total * cap[i]) // capsum) for i in ids}      # floor share, capped
+    assigned = sum(base.values())
+    # distribute the remainder to nodes with the largest fractional share that still have room
+    rem = total - assigned
+    order = sorted(ids, key=lambda i: (-(total * cap[i] % capsum), -cap[i]))
+    k = 0
+    while rem > 0:
+        i = order[k % len(order)]
+        if base[i] < cap[i]:
+            base[i] += 1
+            rem -= 1
+        k += 1
+        if k > 4 * len(order) * (total + 1):                              # safety, never trips if sum(cap)>=total
+            break
+    return base
+
+
 class Scheduler:
     def __init__(self, model: str, total_layers: int):
         self.model = model
@@ -25,15 +50,45 @@ class Scheduler:
         self.nodes: dict[str, JoinedNode] = {}
 
     def register(self, node: JoinedNode) -> None:
-        raise NotImplementedError  # phase 3
+        self.nodes[node.node_id] = node
 
-    def allocate(self) -> dict[str, LayerRange]:
-        """assign each node a contiguous block that fits its vram, covering the stack.
+    def deregister(self, node_id: str) -> None:
+        self.nodes.pop(node_id, None)
 
-        privacy note (docs/ARCHITECTURE.md#privacy): pin the embedding + final blocks
-        to trusted/staked nodes, leave only deep middle blocks to untrusted volunteers.
+    def capacities(self, gb_per_layer: float, kv_gb_per_layer: float = 0.0,
+                   headroom_gb: float = 2.0, boundary_gb: float = 1.0) -> dict[str, int]:
+        """max layers each node's VRAM can hold: model bytes/layer + KV bytes/layer at the
+        target context, minus a runtime headroom (activations/graph) and the boundary weights
+        (embed/lm_head, charged once as slack on every node so the head/tail always fit)."""
+        per = gb_per_layer + kv_gb_per_layer
+        return {nid: max(0, int((n.vram_gb - headroom_gb - boundary_gb) / per))
+                for nid, n in self.nodes.items()}
+
+    def allocate(self, gb_per_layer: float, kv_gb_per_layer: float = 0.0,
+                 headroom_gb: float = 2.0, boundary_gb: float = 1.0) -> dict[str, LayerRange]:
+        """assign each node a contiguous block that fits its vram, covering the whole stack,
+        FAT NODES FIRST (a 48GB card holds more layers than a 24GB one -> fewer nodes, fewer
+        WAN hops). Contiguous so each node's KV-cache is a simple per-block window; the block's
+        layer indices reindex 0-based on the node (pipeline.load_stage --lo/--hi).
+
+        privacy note (docs/ARCHITECTURE.md#privacy): a later pass pins the embedding + final
+        blocks to trusted/staked nodes and leaves only deep middle blocks to untrusted
+        volunteers; this fit is the VRAM-feasibility layer that lands under that policy.
         """
-        raise NotImplementedError  # phase 0 (static) / phase 3 (dynamic+heterogeneous)
+        cap = self.capacities(gb_per_layer, kv_gb_per_layer, headroom_gb, boundary_gb)
+        if sum(cap.values()) < self.total_layers:
+            raise ValueError(f"insufficient VRAM: capacity {sum(cap.values())} layers "
+                             f"< model {self.total_layers}")
+        order = sorted(self.nodes, key=lambda nid: -self.nodes[nid].vram_gb)   # fat node first
+        counts = _distribute(self.total_layers, [(nid, cap[nid]) for nid in order])
+        out, cur = {}, 0
+        for nid in order:
+            c = counts[nid]
+            if c == 0:
+                continue
+            out[nid] = LayerRange(cur, cur + c)
+            cur += c
+        return out
 
     def topology(self, coordinator_id: str, k: int | None = None) -> list[str]:
         """order nodes into the cheapest pipeline loop on the measured rtt mesh.
@@ -53,6 +108,13 @@ class Scheduler:
                     optimal_loop(idx, L, c_out, c_in))
         return [ids[i] for i in order]
 
-    def on_drop(self, node_id: str) -> None:
-        """node died mid-generation: reassign its block, rebuild pipeline, retry in-flight."""
-        raise NotImplementedError  # phase 3/4
+    def on_drop(self, node_id: str, gb_per_layer: float, kv_gb_per_layer: float = 0.0,
+                **fit) -> dict[str, LayerRange]:
+        """node dropped: remove it and re-fit the survivors into a fresh allocation. Returns the
+        new assignment (the caller rebuilds the ring + re-prefills the in-flight request).
+        Raises if the survivors no longer have the VRAM to hold the model -> the scheduler must
+        pull a replacement from the pool before serving. Seamless MID-REQUEST KV migration (no
+        re-prefill) is the genuine research item (roadmap step 7 / INTEGRATION.md §11) and is NOT
+        what this does -- this is the correct, available 'heal by rebuild' floor."""
+        self.deregister(node_id)
+        return self.allocate(gb_per_layer, kv_gb_per_layer, **fit)
