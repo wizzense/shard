@@ -26,10 +26,13 @@ piggybacked, so a round costs exactly one round-trip end to end.
       --next 127.0.0.1:29501 --draft DRAFT --device cuda:0 --draft-device cuda:1 --adaptive
 """
 
-import argparse, socket, time, threading, queue
+import argparse, socket, time, threading, queue, os
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
-import wire
+if os.environ.get("SHARD_TRANSPORT") == "libp2p":   # libp2p sidecar transport (no PSK; see node_kv)
+    import transport as wire
+else:
+    import wire
 from pipeline import load_stage, run_block
 from node_kv import send_msg, recv_msg, EDGE_ERRORS, TransportError
 from tree import accept_tree, gather_cache
@@ -218,7 +221,17 @@ def serve_spec_fast(parts, stage, nstages, listen_port, nxt, timeout, dev, direc
         host, port = nxt.split(":")
 
     def mk_fwd():                                            # (re)build the forward link (+ async sender in direct mode)
-        nonlocal nxt_sock, sender
+        nonlocal nxt_sock, sender, host, port
+        # HOT-HEAL: on a relink, repoint the forward link to a pre-warmed SPARE *without reloading weights*.
+        # The control-plane healer writes "<host>:<port>" to /root/.shard_next_<stage> on the victim's
+        # PREDECESSOR; this is re-read every relink attempt, so the dropped link reconnects to the spare
+        # (warm, weights already in VRAM) instead of the dead victim. Absent file => use the launch --next.
+        try:
+            ov = open(f"/root/.shard_next_{stage}").read().strip()
+            if ov:
+                host, port = ov.split(":")
+        except OSError:
+            pass
         s = socket.socket(); s.settimeout(timeout)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCK_BUF)   # buffer a full ~24MB prefill chunk in-kernel
         s.connect((host, int(port)))

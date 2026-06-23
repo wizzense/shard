@@ -1,0 +1,32 @@
+{
+  "test": "hot-standby mid-request fault tolerance (DEPLOY_READINESS §3 — turn the cold ~131s failover into seconds)",
+  "date": "2026-06-23",
+  "model": "gpt-oss-120b (mxfp4)",
+  "ring": "N=4 scattered US 4090s (CA head · NV · IL · FL) + a HOT spare (WA) holding the victim's block",
+  "mechanism": "vs the cold heal.py: (1) the spare is pre-launched WARM (weights already in VRAM, flex disk-cached) so it does NOT reload on failover — the reload was what dominated the cold 131s; (2) the victim's PREDECESSOR is REWIRED to the spare WITHOUT relaunching — the healer writes the spare endpoint to /root/.shard_next_<pred> and serve_spec_fast.mk_fwd re-reads it on its relink (engine change). No stage is relaunched, no weights reloaded.",
+
+  "result": {
+    "victim_stage": 1, "victim_id": 42259369, "spare_id": 42259384,
+    "killed_mid_generation_under_load": true,
+    "detect_s": 4.3,
+    "committed_before_drop": 423,
+    "total_after_resume": 447,
+    "continuation_preserved": true,
+    "reprefill_s": 8.9,
+    "failover_blip_s": 32.6,
+    "cold_baseline_s": 131,
+    "output_coherent": true
+  },
+
+  "interpretation": "A middle node was killed mid-generation under load. The committed 423 tokens were preserved, the predecessor rewired to the WARM spare with NO model reload, the ring re-prefilled (prompt+423 committed) in 8.9s, and the request completed (447 tok, continuation byte-preserved, coherent output). End-to-end failover blip ~32.6s vs the cold heal.py's ~131s — the ~90s spare WEIGHT RELOAD is eliminated. Of the residual ~32s: detect 4.3s + re-prefill 8.9s + ~20s spent RE-LAUNCHING the coordinator process (a demo artifact — heal_hot.py spawns a fresh coordinator; a live deployment keeps the coordinator warm and re-drives in place, so the real recompute disruption is the 8.9s re-prefill).",
+
+  "honesty": [
+    "Failover is now seconds-to-tens-of-seconds (32.6s, re-prefill 8.9s), not the cold ~131s. The headline win is removing the ~90s weight reload via the hot spare; the rewire is instant.",
+    "The ~20s coordinator-restart inside the 32.6s is incidental to this demo harness (fresh python coordinator each resume) — not a fundamental failover cost. With a warm coordinator the disruption ≈ the 8.9s re-prefill + ~4s detect.",
+    "Token preservation uses the SAME coordinate_pipe resume primitive proven in session 2's cold demo (189 tok preserved); only the spare-warmth + predecessor rewire are new here.",
+    "BLOCK-ONLY re-prefill (re-prefill just the dropped block via upstream activation checkpointing, vs the full prompt+committed) was NOT done — for a short prompt the full re-prefill is already 8.9s; it matters for long-context resume."
+  ],
+
+  "repro": "python3 heal_hot.py --ring CA,NV,IL,FL --spare WA --kill-stage 1 --kill-after 75 --max-ctx 131072 --prompt-file /root/ft_prompt.txt --max-new 1000",
+  "files": ["phase0/heal_hot.py", "phase0/specpipe.py (mk_fwd override read)", "phase0/launch_ngram.py (override cleanup)"]
+}

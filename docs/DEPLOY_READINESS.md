@@ -53,9 +53,15 @@ Tags: 🔴 blocking for any honest deploy · 🟡 needed to escape the niche · 
   predecessor relaunch; other survivors auto-re-handshake), re-prefilled prompt+committed, continued to 256
   tokens — same request, continuation byte-preserved. Engine: `coordinate_pipe(resume_ids, resumable)`; healer:
   `phase0/heal.py`. Failover ~131s (cold-spare reload dominated). [receipt](receipts/fault-tolerance-20260623.json).
-  *Remaining for "fast":* a HOT pre-warmed standby (removes the reload → failover = just the re-prefill) and
-  "re-prefill of JUST the dropped block" via upstream activation checkpointing (vs the full prompt+committed).
-- 🔴 **E/I — Live heal + hot spares** (pre-warmed) so a drop is a <few-sec blip, not a cold relaunch.
+- ✅ **E — HOT standby failover. DONE (2026-06-23).** The cold ~131s is now ~33s: the spare is pre-launched WARM
+  (weights in VRAM, flex disk-cached → NO reload, the thing that dominated the cold path) and the victim's
+  PREDECESSOR is REWIRED to it WITHOUT relaunching (healer writes `/root/.shard_next_<pred>`; `serve_spec_fast`
+  re-reads it on relink). Killed a middle node mid-gen: **423 committed tokens preserved, re-prefill 8.9s, failover
+  blip ~32.6s** (vs 131s cold), request completed, continuation byte-preserved. `phase0/heal_hot.py`. The residual
+  ~20s of the 32.6 is the demo re-launching the coordinator (a harness artifact, not a real failover cost — a
+  warm coordinator drops it to ~detect+re-prefill ≈ 13s). [receipt](receipts/hot-standby-failover-20260623.json).
+  *Remaining:* "re-prefill of JUST the dropped block" via upstream activation checkpointing (matters at long ctx;
+  for a short prompt the full re-prefill is already 8.9s).
 - 🟡 **E — SLA behavior.** Graceful degradation + health so the orchestrator routes around flaky nodes.
 
 ## 4. It's a live permissionless network, not a hand-deployed engine

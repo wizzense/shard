@@ -31,7 +31,7 @@ def launch_stage_uneven(inst, stage, nstages, nxt_ep, served_head, lo, hi, max_c
     env = (f"SHARD_PSK={PSK}" + (" FV_WINDOW=1" if window else "") + (" SHARD_RECEIPTS=1" if receipts else "")
            + (" SHARD_SYNC_SEND=1" if sync_send else ""))
     cmd = (f"nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -r kill -9 2>/dev/null; "
-           f"fuser -k {PORT}/tcp 2>/dev/null; sleep 2; rm -f /root/stage.log; cd /root && "
+           f"fuser -k {PORT}/tcp 2>/dev/null; sleep 2; rm -f /root/stage.log /root/.shard_next_*; cd /root && "
            f"{env} setsid bash -c 'python3 specpipe.py --stage {stage} --nstages {nstages} "
            f"--model {M120} --listen-port {PORT}{nextarg}{head} --fast --direct-return "
            f"--lo {lo} --hi {hi} --max-ctx {max_ctx} --timeout {timeout} > /root/stage.log 2>&1' "

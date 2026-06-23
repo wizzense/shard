@@ -11,7 +11,14 @@
     "ctx_110k": {"prompt_tokens": 114103, "sync_prefill_s": 245.92, "async_prefill_s": 210.02, "speedup": 1.17}
   },
 
-  "interpretation": "Async send is the right fix for the diagnosed handoff wall and it works: at 30k the prefill is HANDOFF-BOUND (chunks attend to <=30k of context, so the 24MB/chunk send is a large fraction of each stage's time) and synchronous send collapses the pipeline overlap (153s) — async restores it (61s, 2.52×). At 110k the prefill is COMPUTE-BOUND: each chunk attends to up to ~110k of accumulated context, so per-chunk attention dwarfs the 24MB handoff; async still helps but only 1.17× (246->210s). So <60s@110k is a COMPUTE wall on 4090s, not a handoff one — 'more stages' lowers per-stage compute (a real but bounded lever) yet won't reach <60s@110k on this hardware.",
+  "interpretation": "Async send is the right fix for the diagnosed handoff wall and it works: at 30k the prefill is HANDOFF-BOUND (chunks attend to <=30k of context, so the 24MB/chunk send is a large fraction of each stage's time) and synchronous send collapses the pipeline overlap (153s) — async restores it (61s, 2.52×). At 110k the prefill is COMPUTE-BOUND: each chunk attends to up to ~110k of accumulated context, so per-chunk attention dwarfs the 24MB handoff; async still helps but only 1.17× (246->210s). So <60s@110k is a COMPUTE wall on 4090s, not a handoff one.",
+
+  "more_stages_lever_N5": {
+    "note": "tested whether more stages reaches <60s@110k — it does NOT. N=5 ring (7 layers/stage) vs N=4 (9 layers/stage), async, warm:",
+    "ctx_110k": {"N4": 210.02, "N5": 201.71, "delta": "~4% better — marginal"},
+    "ctx_30k": {"N4": 60.76, "N5": 69.32, "delta": "WORSE — pipeline fill/drain over few chunks + an extra WAN hop outweigh the smaller per-stage compute"},
+    "verdict": "more stages does NOT meaningfully lower 110k TTFT (the 36-layer attention compute is fixed; only the pipeline ceiling m/(m+p-1) shifts, ~3% at 28 chunks) and HURTS at low chunk counts. <60s@110k is confirmed a COMPUTE wall, not a handoff/stage-count one. Async-send remains the real TTFT lever (2.52×@30k)."
+  },
 
   "honesty": [
     "Single warm-run measurements (no repeats) — the direction (async >= sync at both contexts) is unambiguous but the exact ratios carry run-to-run noise.",

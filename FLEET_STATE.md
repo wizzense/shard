@@ -22,6 +22,28 @@ MoE token-count non-invariance isolated). #2 async-send A/B on the N=4 ring (IL�
 30k 153.3→60.8s (2.52×), 110k 245.9→210.0s (1.17×, compute-bound). N=6 (MI+WA) and #3 hot-standby
 NOT run (budget; documented as next levers). Fleet TORN DOWN after the commit (no idle spend).
 
+## Session 3b (re-spin: N=6/5 TTFT + hot-standby + libp2p re-validation) — LIVE
+User asked to re-spin for the 3 deferred levers. Rented 6 scattered US 4090s; NJ (42259379) had a
+persistent SSH publickey failure (known bad-host pattern) → destroyed. **5 working boxes:**
+| role | id | geo | ip | ssh | :29600 |
+|------|-----|-----|-----|-----|--------|
+| ca (head) | 42259365 | California | 192.234.50.153 | 5720 | 5744 |
+| nv | 42259369 | Nevada | 173.239.95.142 | 41677 | 41684 |
+| fl | 42259376 | Florida | 47.202.225.24 | 16537 | 16646 |
+| il | 42259382 | Illinois | 104.12.231.85 | 40363 | 40369 |
+| wa | 42259384 | Washington | 166.113.48.8 | 16826 | 16432 |
+Pushed: full engine + `/tmp/sidecar` (libp2p, pre-built June-19, works) + `transport.py`. New tooling:
+`heal_hot.py` (#3 hot standby: pre-warmed spare + predecessor rewire via `/root/.shard_next_<pred>`,
+no reload), `launch_libp2p.py` (ring over the sidecar transport, SHARD_TRANSPORT=libp2p, no PSK).
+Plan: N=5 TTFT (more-stages lever) → #3 hot-standby demo (4-ring + 1 spare) → libp2p re-validation.
+
+RESULTS (committed): N=5 TTFT — 110k 201.7s (~4% better than N=4's 210, compute-bound), 30k 69.3s (WORSE
+than 60.8 — more stages doesn't beat the compute wall). #3 hot-standby — kill NV mid-gen: 423 tok preserved,
+re-prefill 8.9s, failover blip ~32.6s (vs 131s cold; ~90s reload eliminated), request completed. libp2p —
+transport + engine-swap PROVEN (2MB round-trip 192ms; engines warm over libp2p), fresh full-ring gen blocked
+by vast SSH/daemon-launch flakiness (fleet-ops, not engine). One box (FL 42259376) leaked 19GB VRAM (unclean
+CUDA kill) — needs reset; destroyed with the rest. FLEET TORN DOWN after the commit (no idle spend).
+
 ## Session 2 (deploy-readiness: sampling / TTFT / fault tolerance) — TORN DOWN
 Rented 5 distinct-host scattered US 4090s (cuda-13.2.1-auto, `-p 29600:29600`): WA·MN·NC·NJ ring (even
 N=4, 9 layers/box) + OH hot-spare. Used for: lossless speculative sampling (DONE), pipelined-prefill TTFT

@@ -13,8 +13,15 @@ head: python node_kv.py --role head --split 24 --peer 172.17.0.3 --port 29501 --
 import argparse, os, socket, time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
-import wire
-from wire import send_msg, recv_msg   # authenticated + encrypted + pickle-free wire (was raw pickle here)
+# SHARD_TRANSPORT=libp2p swaps the trusted-wire (ChaCha+PSK over raw TCP) for the libp2p sidecar
+# transport (shard/transport.py, pushed flat as transport.py): identity+encryption are the sidecar's
+# job, so send_msg/recv_msg drop the seal. The engine is otherwise unchanged — same call sites.
+if os.environ.get("SHARD_TRANSPORT") == "libp2p":
+    import transport as wire
+    from transport import send_msg, recv_msg
+else:
+    import wire
+    from wire import send_msg, recv_msg   # authenticated + encrypted + pickle-free wire (was raw pickle here)
 
 # transport-layer errors we treat as "edge is dead/frozen" (socket.timeout and every
 # ConnectionError subclass are OSError, so this one tuple covers them all). wire.recv_msg

@@ -33,10 +33,27 @@ Fresh N=4 scattered US ring (IL·NV·CA·NJ, 4 distinct 4090 hosts). Two engine 
   wall); `SHARD_SYNC_SEND=1` forces the old path for a clean same-ring A/B. Result (N=4, warm): **30k TTFT
   153.3→60.8s (2.52×)**, **110k 245.9→210.0s (1.17×)**. At 30k the prefill is handoff-bound, so async restores the
   pipeline overlap (2.5×); at 110k it's COMPUTE-bound (each chunk attends to ~110k of context), so the 24MB
-  handoff is a small fraction and async helps modestly. **`<60s@110k` is a compute wall on 4090s, not handoff** —
-  more stages is a real but bounded lever. The win would be LARGER on thin consumer uplinks (handoff-dominated).
-  [receipt](docs/receipts/async-send-ttft-20260623.json). (Runs on raw-TCP+wire/PSK, not the libp2p sidecar —
-  mechanism is transport-agnostic; libp2p re-validation is the documented gap.)
+  handoff is a small fraction and async helps modestly. **`<60s@110k` is a compute wall on 4090s, not handoff.**
+  Confirmed by an N=5 ring (7 layers/stage): 110k **201.7s** (only ~4% better than N=4's 210 — the 36-layer
+  attention compute is fixed) and 30k **69.3s** (WORSE than N=4's 60.8 — pipeline fill/drain over few chunks +
+  an extra hop). So MORE STAGES does NOT beat the compute wall; async-send is the real TTFT lever. The win would
+  be LARGER on thin consumer uplinks (handoff-dominated). [receipt](docs/receipts/async-send-ttft-20260623.json).
+
+- **§3 HOT-standby failover — DONE.** Cold heal.py was ~131s (spare weight reload). Now the spare is pre-launched
+  WARM (weights in VRAM, flex disk-cached) and the victim's PREDECESSOR is REWIRED to it without relaunch (healer
+  writes `/root/.shard_next_<pred>`; `serve_spec_fast.mk_fwd` re-reads it). Killed a middle node mid-gen: **423
+  committed tokens preserved, re-prefill 8.9s, failover blip ~32.6s** (vs 131s cold — the ~90s reload is gone),
+  request completed, continuation byte-preserved. `phase0/heal_hot.py`. (The ~20s of the 32.6 beyond detect+reprefill
+  is the demo re-launching the coordinator — a harness artifact.) [receipt](docs/receipts/hot-standby-failover-20260623.json).
+
+- **libp2p re-validation — transport + engine-swap PROVEN; fresh gen blocked by fleet flakiness.** All the perf
+  runs above use raw-TCP+wire/PSK, not the libp2p sidecar. This session re-confirmed: cross-box libp2p works
+  (2 MiB round-trip NV→CA, 192ms, no PSK) and the engine runs over libp2p via `SHARD_TRANSPORT=libp2p` (swaps
+  `wire.py`→`shard/transport.py`; engines warmed over the sidecar tunnels). A fresh full-ring async-send gen
+  did NOT complete — blocked by vast SSH/daemon-launch flakiness on the multi-sidecar bring-up (orthogonal to
+  engine/transport). The June-19 receipt already proved the full ring over libp2p BIT-IDENTICAL at 44.79 tok/s,
+  and async-send is transport-agnostic (above `send_msg`). New: `phase0/launch_libp2p.py`.
+  [receipt](docs/receipts/libp2p-revalidation-20260623.json).
 
 ## 2026-06-23 (session 2) — deploy-readiness: lossless sampling, faster TTFT, mid-request fault tolerance
 Three engine-side gaps from [docs/DEPLOY_READINESS.md](docs/DEPLOY_READINESS.md), attacked on a fresh N=4 WAN swarm (WA·MN·NC·NJ, 4 distinct 4090 hosts, even 9-layer split) + an Ohio hot-spare:
