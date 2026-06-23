@@ -208,7 +208,7 @@ No throwaway code, but a real swarm runs *soon* so the design gets pressure-test
    automatic swarm.*
 5. **Job routing + signed receipts + per-node payment** — **live & earning on c0mpute.**
 6. **Reputation upgrade + layer-block spot-check** — trust hardening.
-7. **Heal + mid-request fault tolerance.**
+7. **Heal + mid-request fault tolerance.** ◑ *Demonstrated (2026-06-23): engine resume primitive `coordinate_pipe(resume_ids, resumable)` + spare-splice healer `phase0/heal.py` — kill a node mid-gen, the request resumes on a spare and completes. [receipt](receipts/fault-tolerance-20260623.json).*
 8. **P2P propagation** takes over from the mirror (additive).
 
 Each step leaves a running, correct system.
@@ -219,8 +219,10 @@ Each step leaves a running, correct system.
 
 - **Layer-block spot-check at scale**, and eventually a cheap cryptographic proof to replace
   re-compute-and-compare.
-- **Mid-request KV fault tolerance** — a node vanishing mid-token means recompute, not
-  seamless migration.
+- **Mid-request KV fault tolerance** — the *recover-and-complete* half is demonstrated
+  (re-prefill prompt+committed on a spliced-in spare, resume; `phase0/heal.py`). What's still
+  research: *seamless* migration — a hot pre-warmed standby (no reload) + re-prefilling only the
+  dropped block (via upstream activation checkpointing) instead of the full committed prefix.
 - **Decentralized scheduling** — the control-plane seam, when we take it.
 - **Privacy** — boundary-layer pinning + trusted-only routing; earns its word phase by phase.
 

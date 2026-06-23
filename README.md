@@ -80,7 +80,9 @@ into stage 0, which embeds them; the chain verifies all K+1 in one forward trave
 the tail returns the argmaxes straight to the coordinator (one hop, not relayed back);
 the coordinator greedy-accepts the longest matching prefix. Many such chunks are in
 flight at once (the pipeline), and the draft replays a captured CUDA graph against a
-static KV cache.
+static KV cache. Greedy is the default; the same path also does **lossless temperature/top-p
+sampling** — the tail runs speculative-sampling rejection so the committed token distribution
+exactly matches the target's, at no speed cost vs greedy (`shard/specsample.py`).
 
 ## Why this is hard
 
@@ -157,8 +159,13 @@ gpt-oss-120B is the faster, consumer-card build target the network is bootstrapp
   activation quantization, edge supervision.
 - **Phase 2 — Speculative decoding.** Draft-and-verify over the swarm — **done at
   GLM-5.2 744B scale, ~30 tok/s greedy over WAN** (and gpt-oss-120B at ~18–25, above).
+  Now **lossless temperature/top-p/top-k sampling** too (not just greedy): speculative-sampling
+  rejection at the tail (`shard/specsample.py`), the committed distribution provably equal to the
+  target's. Receipt: [docs/receipts/sampling-lossless-20260623.json](docs/receipts/sampling-lossless-20260623.json).
 - **Phase 3 — Permissionless swarm.** One-command join, dynamic layer allocation
-  across heterogeneous GPUs, per-token payouts, fault tolerance.
+  across heterogeneous GPUs, per-token payouts, fault tolerance — **mid-request heal demonstrated**
+  (kill a node mid-generation, the request resumes on a spare and completes; `phase0/heal.py`,
+  [receipt](docs/receipts/fault-tolerance-20260623.json)).
 
 Full detail, pass/fail criteria, and risks: [docs/ROADMAP.md](docs/ROADMAP.md).
 

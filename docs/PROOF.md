@@ -89,6 +89,10 @@ skeptic checks the engine file against). `reference.token_ids` lets anyone re-ru
   `tokens_match` is the **lossless-optimization check** — the CUDA-graphed speculative path is
   byte-identical to the plain eager path of the *same engine* (computed from two real run dumps),
   so the speedup changes nothing about the output.
+- The engine also supports **lossless temperature/top-p/top-k sampling** (`shard/specsample.py`) — not
+  bit-deterministic but **seeded-reproducible**, and proven lossless *distributionally* (the committed
+  token distribution equals the target's): [`receipts/sampling-lossless-20260623.json`](receipts/sampling-lossless-20260623.json).
+  The greedy receipts above use the deterministic path; `temp=0` is bit-identical to it.
 - For a **quantized** model, bit-exact reproduction across *different* engines/backends is not
   achievable in general (and not unique to Shard): batched vs single-token kernels round
   floating-point differently, so at a genuine near-tie two correct greedy decoders can pick

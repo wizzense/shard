@@ -100,8 +100,11 @@ rails — each node earns for the tokens its block helped produce. The honest fr
 - **Privacy.** A node decrypts to run its layer, so it sees the activations it processes. Mitigation:
   pin the leaky boundary layers (embedding, final layers) to staked/trusted nodes; route sensitive
   requests to trusted-only. "Private" earns its word phase by phase, never on day one.
-- **Fault tolerance.** Recovering a request when a node vanishes mid-token (KV migration) is harder
-  than failover-for-new-requests.
+- **Fault tolerance.** Recover-and-complete is **demonstrated** — on a node drop the committed tokens
+  are preserved and the request resumes on a spliced-in spare (re-prefill prompt+committed; `phase0/heal.py`,
+  [`receipts/fault-tolerance-20260623.json`](receipts/fault-tolerance-20260623.json)). *Seamless* migration
+  (a hot standby with no reload + re-prefilling only the dropped block via KV/activation checkpointing,
+  vs the full committed prefix) is the harder remaining half.
 
 ## The path
 
