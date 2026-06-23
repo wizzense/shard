@@ -34,6 +34,7 @@ from pipeline import load_stage, run_block
 from node_kv import send_msg, recv_msg, EDGE_ERRORS, TransportError
 from tree import accept_tree, gather_cache
 from fastverify import FastVerify
+from ngram_draft import NgramDrafter
 
 
 def serve_spec(parts, stage, nstages, listen_port, nxt, timeout, dev, direct=False):
@@ -194,9 +195,11 @@ def serve_spec_fast(parts, stage, nstages, listen_port, nxt, timeout, dev, direc
                     if "par" in msg:                       # TREE verify (fixed-topology graph)
                         h = fv.tree_decode(x, msg["start"], msg["par"], msg["dep"])
                     else:                                  # LINEAR verify (prefill, then graphed decode)
-                        h = fv.prefill(x, msg["start"]) if (first or msg.get("prefill")) else fv.decode(x, msg["start"]); first = False
+                        is_pf = first or msg.get("prefill")
+                        h = fv.prefill(x, msg["start"]) if is_pf else fv.decode(x, msg["start"]); first = False
                     if is_tail:
-                        h = parts["norm"](h)
+                        # prefill: only the last token's logit is consumed -> avoid a [chunk x vocab] OOM
+                        h = parts["norm"](h[:, -1:] if ("par" not in msg and is_pf) else h)
                         send_msg(conn, parts["lm_head"](h).argmax(-1)[0].tolist())
                     else:
                         fwd = {"op": "verify", "h": h.cpu(), "start": msg["start"], "prefill": msg.get("prefill")}
@@ -292,7 +295,13 @@ def serve_tail_fast(parts, listen_port, timeout, dev, max_ctx=2048):
                 if "par" in msg:                           # TREE verify
                     h = fv.tree_decode(x, msg["start"], msg["par"], msg["dep"])
                 else:
-                    h = fv.prefill(x, msg["start"]) if (first or msg.get("prefill")) else fv.decode(x, msg["start"]); first = False
+                    is_pf = first or msg.get("prefill")
+                    h = fv.prefill(x, msg["start"]) if is_pf else fv.decode(x, msg["start"]); first = False
+                    # prefill: the coordinator only consumes the LAST token (next-token after the chunk),
+                    # so run lm_head on just that position -- a full [chunk x vocab] logit tensor is ~1.5GB
+                    # at chunk 4096 and OOMs a 24GB tail at long context. decode needs all K+1 logits.
+                    if is_pf:
+                        h = h[:, -1:]
                 h = parts["norm"](h)
                 send_msg(ret, parts["lm_head"](h).argmax(-1)[0].tolist())
             except EDGE_ERRORS as e:                        # return channel gone -> re-accept it, keep pred + KV
@@ -485,7 +494,7 @@ def coordinate(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout,
 
 def coordinate_pipe(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout, depth, ret_sock=None,
                     ignore_eos=False, prefill_chunk=0, draft_ctx=0, on_commit=None, reasoning=None, system=None,
-                    max_ctx=0):
+                    max_ctx=0, local_draft=None):
     """PIPELINED coordinator: keep `depth` verify chunks in flight over the ring, so
     throughput approaches the ring's per-chunk THROUGHPUT, not its full latency (the
     GLM-pipe lever, on the gpt-oss fast-verify path). Same K+1-token chunk as the
@@ -493,9 +502,21 @@ def coordinate_pipe(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout, dep
     the StaticKV writes at each chunk's `start`, so after a divergence the fresh chunk
     (sent next) overwrites the stale chunks' KV and the coordinator just discards the
     stale RESULTS. Greedy => output identical to the synchronous path. Needs the swarm
-    in --direct-return mode (fire-forward stages, tail returns straight here)."""
+    in --direct-return mode (fire-forward stages, tail returns straight here).
+
+    The draft source is pluggable: a vLLM draft over `draft_sock` (the request/fetch
+    socket protocol), or an in-process `local_draft` (model-free n-gram drafter) that
+    speaks the same request()/fetch() async shim. n-gram is the long-context path — it
+    raises g with no model and no KV, so spec-decode survives past 100k where the 20b
+    draft OOMs. Either way the swarm verifies every token, so output is identical."""
     pipe_sock.settimeout(timeout)
     rx = ret_sock if ret_sock is not None else pipe_sock
+    use_local = local_draft is not None
+    def d_request(ids, k):                       # issue a draft request (one outstanding)
+        if use_local: local_draft.request(ids, k)
+        else: send_msg(draft_sock, {"ids": ids, "k": k})
+    def d_fetch():                               # collect the proposed k tokens
+        return local_draft.fetch() if use_local else recv_msg(draft_sock)
     eos = tok.eos_token_id
     ct_kw = {"reasoning_effort": reasoning} if reasoning else {}   # gpt-oss: 'low' -> terse analysis, more budget for the answer
     msgs = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prompt}]
@@ -536,13 +557,13 @@ def coordinate_pipe(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout, dep
         # recent tokens); the full swarm still verifies with the complete context. Windowing the draft
         # query keeps the draft fast at long context (a full-95k draft is ~800ms/round and kills spec).
         dq = lambda: (dprefix[-draft_ctx:] if draft_ctx else dprefix)
-        send_msg(draft_sock, {"ids": dq(), "k": K})               # prime: one outstanding request
+        d_request(dq(), K)                                        # prime: one outstanding request
         while not done:
             while len(inflight) < depth and not done:                  # FILL the pipeline
-                td = time.time(); ds = recv_msg(draft_sock); t_draft += time.time() - td  # ready (overlapped)
+                td = time.time(); ds = d_fetch(); t_draft += time.time() - td  # ready (overlapped)
                 send_msg(pipe_sock, {"op": "verify", "token_ids": [dprefix[-1]] + ds, "start": send_pos})
                 inflight.append((send_pos, ds)); dprefix = dprefix + ds; send_pos += K
-                send_msg(draft_sock, {"ids": dq(), "k": K})           # issue next -> runs during the read below
+                d_request(dq(), K)                                    # issue next -> runs during the read below
             tr = time.time(); r = recv_msg(rx); t_recv += time.time() - tr   # READ one result
             sp, ds = inflight.pop(0)
             if discard > 0:                                            # stale (post-divergence) -> skip
@@ -559,13 +580,13 @@ def coordinate_pipe(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout, dep
                 committed = ds[:n] + [r[n]]
                 out.extend(committed); cur = r[n]; pos += n + 1
                 discard = len(inflight)                                # every chunk still in flight is stale
-                recv_msg(draft_sock)                                   # outstanding draft is stale -> drop it
+                d_fetch()                                             # outstanding draft is stale -> drop it
                 dprefix = prompt_ids + out; send_pos = pos             # re-draft from the corrected prefix
-                send_msg(draft_sock, {"ids": dq(), "k": K})           # re-prime from the corrected prefix
+                d_request(dq(), K)                                    # re-prime from the corrected prefix
             if on_commit: on_commit({"phase": "decode", "out": out, "dt": time.time() - t0})
             if len(out) >= max_new or (not ignore_eos and (cur == eos or eos in committed)):
                 done = True
-        recv_msg(draft_sock)                                          # drain the outstanding draft request
+        d_fetch()                                                     # drain the outstanding draft request
         while inflight:                                               # drain unread results -> sockets clean for next gen
             recv_msg(rx); inflight.pop(0)
     except EDGE_ERRORS as e:
@@ -698,6 +719,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--stage", type=int, default=0)
     ap.add_argument("--nstages", type=int, required=True)
+    ap.add_argument("--lo", type=int, default=-1, help="explicit layer-block start (uneven VRAM-aware split; -1 = even)")
+    ap.add_argument("--hi", type=int, default=-1, help="explicit layer-block end (exclusive; -1 = even split)")
     ap.add_argument("--coordinator", action="store_true", help="in-house entry node: draft + drive, no 120B layers")
     ap.add_argument("--served-head", action="store_true", help="stage 0 runs as a swarm serve node (embeds token ids)")
     ap.add_argument("--direct-return", action="store_true", help="tail sends results straight to the coordinator (1 hop, not relayed)")
@@ -710,6 +733,11 @@ def main():
     ap.add_argument("--device", default="cuda:0")           # this stage's block
     ap.add_argument("--draft-device", default="cuda:1")     # draft (head only; its own GPU)
     ap.add_argument("--draft-server", default="", help="host:port of the in-house vLLM draft service (else local draft)")
+    ap.add_argument("--ngram-draft", action="store_true", help="coordinator: model-free n-gram/prompt-lookup drafter "
+                    "(no draft server, no KV) — the long-context spec-decode path; survives past 100k where the 20b draft OOMs")
+    ap.add_argument("--ngram-n", type=int, default=3, help="n-gram suffix length for --ngram-draft (tune 2-4)")
+    ap.add_argument("--reasoning", default="", help="gpt-oss reasoning_effort (low|medium|high); low cuts the "
+                    "analysis channel so the answer starts sooner (key for copy/retrieval-heavy long-ctx tasks)")
     ap.add_argument("--K", type=int, default=6)
     ap.add_argument("--adaptive", action="store_true", help="tune K live from the running acceptance rate")
     ap.add_argument("--fast", action="store_true", help="serve node: static-cache CUDA-graph verify (~5x, fixed-K linear)")
@@ -741,8 +769,14 @@ def main():
 
     if args.coordinator:                                    # in-house entry node: no 120B, just tokenizer + draft + swarm
         tok = AutoTokenizer.from_pretrained(args.model)     # 20b tokenizer == 120b tokenizer
-        dh, dp = args.draft_server.split(":")
-        draft_sock = socket.socket(); draft_sock.connect((dh, int(dp)))
+        local_draft = None
+        if args.ngram_draft:                                # model-free drafter: no draft server/socket needed
+            local_draft = NgramDrafter(ng=args.ngram_n)
+            draft_sock = None
+            print(f"[coord] n-gram drafter (ng={args.ngram_n}); no draft server", flush=True)
+        else:
+            dh, dp = args.draft_server.split(":")
+            draft_sock = socket.socket(); draft_sock.connect((dh, int(dp)))
         host, port = args.next.split(":")
         pipe_sock = socket.socket(); pipe_sock.settimeout(args.timeout); pipe_sock.connect((host, int(port)))
         ret_sock = None
@@ -808,7 +842,8 @@ def main():
             for kv in ks:
                 r = coordinate_pipe(draft_sock, pipe_sock, tok, args.prompt, kv, args.max_new,
                                     args.timeout, args.depth, ret_sock=ret_sock, prefill_chunk=args.prefill_chunk,
-                                    draft_ctx=args.draft_ctx)
+                                    draft_ctx=args.draft_ctx, local_draft=local_draft,
+                                    reasoning=(args.reasoning or None))
                 print(f"[PIPE K={kv} depth={args.depth}] {r['tok_s']:.2f} tok/s | {r['toks_per_traversal']:.2f} tok/traversal | "
                       f"accept {r['mean_accept']:.2f} | +{r['wasted']} stale | "
                       f"draft {r['draft_ms']:.0f}ms recv {r['recv_ms']:.0f}ms/round", flush=True)
@@ -846,7 +881,9 @@ def main():
             print(f"[coord] dumped run -> {args.dump} (sha256 {hashlib.sha256(json.dumps(ids).encode()).hexdigest()[:16]}..)", flush=True)
         return
 
-    parts = load_stage(args.model, args.stage, args.nstages, device=args.device, attn=args.attn)
+    _lo = args.lo if args.lo >= 0 else None
+    _hi = args.hi if args.hi >= 0 else None
+    parts = load_stage(args.model, args.stage, args.nstages, device=args.device, attn=args.attn, lo=_lo, hi=_hi)
 
     if args.stage != 0 or args.served_head:                 # swarm serve node (stage 0 embeds token ids)
         is_tail = args.stage == args.nstages - 1

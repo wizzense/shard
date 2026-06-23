@@ -78,18 +78,23 @@ def run_block(h, parts, cache, start, par=None, dep=None):
     return h
 
 
-def load_stage(model_id, stage, nstages, device="cuda", dtype="auto", attn="eager"):
+def load_stage(model_id, stage, nstages, device="cuda", dtype="auto", attn="eager", lo=None, hi=None):
     """load ONLY this stage's contiguous block of layers onto the GPU (+ embed on
     the head, norm/lm_head on the tail). every other component is mapped to "meta"
     so it is never loaded -- this is what lets a node hold a slice of a model far
     too big for its card (a 57GB 120B over 4 nodes = ~14GB each). layer_idx is
     reindexed 0-based for the per-node cache. dtype="auto" preserves a checkpoint's
-    own precision (e.g. gpt-oss mxfp4) instead of upcasting it."""
+    own precision (e.g. gpt-oss mxfp4) instead of upcasting it.
+
+    Default block = the even split [stage*L/N : (stage+1)*L/N]. Pass explicit lo/hi for a
+    VRAM-aware UNEVEN split (a fat node holds more layers) on heterogeneous hardware --
+    still a contiguous block; head/tail boundary weights stay keyed off the stage index."""
     from transformers import AutoConfig
     cfg = AutoConfig.from_pretrained(model_id)
     n_layers = cfg.num_hidden_layers
-    lo = stage * n_layers // nstages
-    hi = (stage + 1) * n_layers // nstages
+    if lo is None or hi is None:
+        lo = stage * n_layers // nstages
+        hi = (stage + 1) * n_layers // nstages
     is_head, is_tail = stage == 0, stage == nstages - 1
     tied = bool(getattr(cfg, "tie_word_embeddings", False))   # then lm_head shares embed's weight
     dmap = {"model.embed_tokens": device if (is_head or (is_tail and tied)) else "meta",
