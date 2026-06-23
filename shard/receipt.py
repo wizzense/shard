@@ -27,7 +27,10 @@ import json
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
-from .manifest import gen_key, load_key, pub_b64, save_key  # noqa: F401  (shared ed25519 key helpers)
+try:                                                          # package import (engine repo)
+    from .manifest import gen_key, load_key, pub_b64, save_key  # noqa: F401
+except ImportError:                                           # flat import (deployed next to the node code)
+    from manifest import gen_key, load_key, pub_b64, save_key  # noqa: F401
 
 SCHEMA = "shard-receipt/1"
 

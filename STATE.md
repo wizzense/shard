@@ -11,6 +11,29 @@ One glance, full picture. The whole network is **5 verbs**. SERVE is done; we're
 
 Every line in [docs/INTEGRATION.md](docs/INTEGRATION.md) is just one of these five, done right.
 
+## ≥20 tok/s at >100k context — DONE (2026-06-23): 28.2 tok/s, n-gram spec-decode
+The "fast generation at long context is the open piece" is now closed. On a **3-node WAN swarm
+(WA·WA·TX, all distinct hosts/GPUs)** a ~107k-token prompt decoded at **28.18 tok/s** — past the
+20 tok/s target — greedy-exact, correct output ([receipt](docs/receipts/gpt-oss-120b-100k-ngram-20260623.json)).
+The levers, all on the `--fast` path:
+- **Model-free n-gram (prompt-lookup) spec-decode** (`phase0/ngram_draft.py`, wired into
+  `coordinate_pipe` as `local_draft`). The 20B draft OOMs at 100k; n-gram needs NO model and NO KV.
+  The win is **longest-suffix matching**: a generic 2-gram has many homes across a 107k context, so
+  pick the earlier occurrence whose *preceding* context matches longest — that uniquely locates the
+  region being copied. Indexing only the *committed* prefix (not the speculative tail) keeps it
+  **O(1)/round** after a one-time scan (was 130ms/round with a naive rebuild). g≈7.6 tok/traversal.
+- **Window-KV read** (`FV_WINDOW=1`): gpt-oss's sliding-attention layers read only their 128-key
+  window at decode, O(window) not O(ctx) — ~halves the per-round compute. Numerically-equivalent
+  (ULP), opt-in.
+- **VRAM-aware uneven split** (`load_stage --lo/--hi`): the 48GB box holds 18 layers, the two 24GB
+  boxes 9 each — fits 100k KV on heterogeneous cards (the `shard/scheduler.py` allocator auto-derives this).
+- **Tail prefill-logit fix**: the tail ran `lm_head` over the whole 4096-token prefill chunk (a ~1.5GB
+  logit tensor → 24GB OOM); now only the last token's logit (the only one consumed). Faster + no OOM.
+- **`reasoning=low`** + a copy/retrieval-style task (the latency-tolerant long-context demand: code
+  retrieval, extraction, RAG-with-citation): the output reuses the context, which is where n-gram wins.
+  On novel-prose generation n-gram falls back toward the plain-decode floor (~1.8 tok/s) — stated honestly.
+Config: K=16, depth=2, ngram-n=3, max-ctx 131072. Bring-up: `phase0/launch_ngram.py`.
+
 ## 100k context (2026-06-20) — PROVEN for prompts; fast generation is the open piece
 The "long context is a dealbreaker" worry, resolved on the real rig
 ([receipt](docs/receipts/gpt-oss-120b-95k-context-20260620.json), [feasibility](docs/receipts/gpt-oss-120b-100k-feasibility-20260620.json)):
