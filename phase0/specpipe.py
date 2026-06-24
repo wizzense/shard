@@ -270,8 +270,10 @@ def serve_spec_fast(parts, stage, nstages, listen_port, nxt, timeout, dev, direc
         fv.reset(); first = True; verifies = 0
         with torch.no_grad():
             while True:
-                try:
-                    msg = recv_msg(conn)
+                msg = None                                    # bind before recv: a partial/corrupt frame (e.g. a
+                try:                                          # peer resetting mid-message during a heal) must hit the
+                    msg = recv_msg(conn)                      # 'bad msg -> reset' path below, not crash on unbound msg
+
                     if msg["op"] == "reset":
                         fv.reset(); first = True
                         sampler = Sampler(temp=msg.get("temp", 0.0), top_p=msg.get("top_p", 1.0),

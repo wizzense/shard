@@ -1,4 +1,29 @@
-# Shard fleet — 2026-06-23
+# Shard fleet — 2026-06-24
+
+## Session 4 (the REAL warm libp2p number + full stack over libp2p) — TORN DOWN
+Goal: kill the libp2p OPEN THREAD — warm, realistic libp2p tok/s (the 2.86 cold floor was meaningless),
+A/B vs raw-TCP, + the full stack over libp2p (sampling + receipts + mid-request kill→heal). Rented 5
+scattered US 4090s (cuda-13.2.1-auto, ALL `--env '-p 29600:29600'`), distinct states/hosts:
+| role | id | geo | gpu |
+|------|-----|-----|-----|
+| MN (head) | 42330406 | Minnesota | 24GB |
+| IL | 42330407 | Illinois | 24GB |
+| MI | 42330411 | Michigan | 24GB |
+| TX (tail) | 42330412 | Texas | 24GB |
+| WA (hot spare) | 42330409 | Washington | **48GB** |
+~$2/hr. Bootstrap: fleet.py push engine+**manifest.py**+receipt.py+transport.py+sidecar+~/.hf_token →
+stage_bootstrap (authenticated HF pull ~200MB/s, ~6min for 57GB). N=4 even ring (9L/box) + WA spare.
+
+RESULTS (committed): §1a libp2p≈raw-TCP at PARITY (matched RTT 25.28 vs 25.55, bit-identical sha 052193a9;
+warm range 18.4–36.0 tok/s = WAN jitter, not tax). §1b sampling over libp2p 22.69 tok/s coherent; signed
+receipts over libp2p VERIFIED (4 stages, sigs valid, chain, coverage [0:36]); libp2p hot-heal MECHANISM
+done + components proven (relink + sidecar-repoint + spare survives) but end-to-end resume WIP. FLEET TORN
+DOWN after the commit.
+GOTCHAS (remember): (1) **receipt.py needs manifest.py** on the box (was missing from the push set →
+receipts silently skipped). (2) **transport-switch relaunch can OOM** — clean-reset (kill GPU procs + free
+29600/29610/29611/29612 + wait VRAM<1GB) between libp2p↔raw-TCP switches. (3) **libp2p heal ≠ raw-TCP heal**
+(sidecar-repoint, not `.shard_next`). (4) WAN RTT drifts 171-340ms/round — use recv/round + multiple samples,
+not a single A/B pair.
 
 ## Session 3 (batched verify + async inter-stage send) — LIVE
 Goal: #1 concurrent/continuous request batching (batched fast-verify CUDA graph) + #2 async

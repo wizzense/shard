@@ -1,0 +1,45 @@
+{
+  "test": "Full stack over libp2p (per-node ed25519 keys, Noise-encrypted, NO SHARD_PSK): lossless sampling + signed per-stage receipts (verified) + the libp2p hot-heal mechanism, on gpt-oss-120B sharded across N scattered US nodes.",
+  "date": "2026-06-24",
+  "model": "gpt-oss-120b (mxfp4)",
+  "transport": "go-libp2p sidecar (TCP<->libp2p tunnel, per-node ed25519 keys, Noise-encrypted, NO SHARD_PSK)",
+  "ring": "N=4 scattered US 4090s (MN.IL.MI.TX, 4 distinct hosts) + a 48GB WA hot spare (Washington)",
+
+  "1_warm_speed_over_libp2p": {
+    "status": "DONE",
+    "copy_task_warm_tok_s_range": "18.4-36.0 (WAN-RTT dependent; peak 36.0 @ recv 171ms/round)",
+    "parity_with_raw_tcp": "at matched RTT libp2p 25.28 ~ raw-TCP 25.55 (1.1%), output BIT-IDENTICAL",
+    "see": "docs/receipts/libp2p-warm-ab-20260624.json"
+  },
+
+  "2_lossless_sampling_over_libp2p": {
+    "status": "DONE",
+    "result": "temp=0.7 sampled generation over the sidecar — 22.69 tok/s, coherent output (the db.ts copy), output_sha256 0ba858e0",
+    "mechanism": "shard/specsample.py deterministic-drafter rejection sampling at the tail; transport-agnostic, ran unchanged over libp2p",
+    "losslessness": "proven separately (session 2: math TV 0.0053, on-swarm TV==noise floor) — this run shows it carries to the real transport"
+  },
+
+  "3_signed_receipts_over_libp2p_PROVE": {
+    "status": "DONE",
+    "result": "coordinator swept the ring -> 4 signed per-stage receipts, EVERY signature VALID",
+    "chain": "in->out activation roots chain across the ring: s0[0:9] 30be40ef->f472ad98 | s1[9:18] f472ad98->af545705 | s2[18:27] af545705->71dae546 | tail[27:36] 71dae546->94246505",
+    "coverage": "blocks tile [0:36] no gap/overlap — every layer attested by a DISTINCT signed node (4 distinct pubkeys)",
+    "verdict": "ALL receipts valid + full layer coverage — coordinator cannot fabricate, no node paid without proving its block",
+    "mechanism": "SHARD_RECEIPTS=1 per-stage signers (shard/receipt.py + shard/manifest.py) + the coordinator's verify_receipt/verify_coverage sweep, all over libp2p"
+  },
+
+  "4_mid_request_hot_heal_over_libp2p": {
+    "status": "MECHANISM IMPLEMENTED + COMPONENTS PROVEN; end-to-end resume NOT yet completing over libp2p (documented remaining work)",
+    "what_works": [
+      "phase0/heal_hot_libp2p.py: the libp2p analogue of heal_hot.py. Kills a middle node mid-request; the coordinator detects the dead ring (~4s) and dumps committed tokens.",
+      "the libp2p-specific heal: relaunch the PREDECESSOR's sidecar with its ring-forward :29611 repointed to the warm spare (libp2p needs this — the pred engine only ever dials its LOCAL sidecar, which stays alive when the remote victim dies, so raw-TCP's .shard_next ip:port rewire never fires). VERIFIED: the pred engine relinks, and the pred's sidecar establishes a DIRECT libp2p connection to the spare.",
+      "the spare survives the relink connection-churn (after a real engine bug fix — see below)."
+    ],
+    "real_engine_bug_found_and_fixed": "specpipe.py serve_spec_fast: the `except Exception` (bad-message) handler referenced `msg` before it was bound — a partial/corrupt frame during the heal's connection churn raised UnboundLocalError and CRASHED the stage instead of resetting it. Fixed (msg=None before recv); a stage now survives a bad frame as intended. This is a general robustness fix, not heal-specific.",
+    "remaining_issue": "after the mid-ring node swap, the head->spare->stage2->tail path doesn't yet deliver end-to-end over libp2p: the head relinks to :29611 (now -> spare) but the forwarded stream isn't reaching the spare ENGINE, and the resume coordinator deadlocks on the direct-return read. The multi-hop libp2p re-handshake after a live node substitution is the control-plane work left.",
+    "fallback_proof": "mid-request fault tolerance ITSELF is proven on raw-TCP (HOT-standby failover, 423 tokens preserved, ~33s vs 131s cold — docs/receipts/hot-standby-failover-20260623.json). The engine resume primitive (coordinate_pipe resume_ids) is transport-agnostic; only the libp2p control-plane re-wiring is unfinished."
+  },
+
+  "honest_summary": "Three of the four full-stack pieces are PROVEN over the real permissionless transport (no PSK): warm speed at raw-TCP parity, lossless sampling, and verified signed per-stage receipts. The libp2p hot-heal is implemented with the correct mechanism and its components are proven (relink, sidecar-repoint, DIRECT spare connection, spare-survival) plus a real engine crash bug was fixed along the way; the end-to-end resume over libp2p is the remaining control-plane work. Fault tolerance is already proven on raw-TCP.",
+  "files": ["phase0/launch_libp2p.py (--receipts/--temp/--seed/--layers)", "phase0/heal_hot_libp2p.py", "phase0/specpipe.py (msg-bind robustness fix)", "shard/transport.py", "shard/receipt.py", "shard/specsample.py", "sidecar/main.go"]
+}

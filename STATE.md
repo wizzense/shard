@@ -12,6 +12,44 @@ the PROVE primitives are now in; only PAY (c0mpute rails) and the live integrati
 
 Every line in [docs/INTEGRATION.md](docs/INTEGRATION.md) is just one of these five, done right.
 
+## 2026-06-24 (session 4) — the REAL WARM libp2p number (parity) + the full stack over the real transport
+Fresh N=4 scattered US ring (MN·IL·MI·TX, 4 distinct 4090 hosts, even 9-layer split) + a 48GB WA hot
+spare. Closes the libp2p OPEN THREAD — the warm, realistic libp2p speed (the 2.86 cold floor was
+meaningless). Authenticated HF pull (~200MB/s) brought 5 boxes up fast.
+
+- **§1a WARM libp2p vs raw-TCP A/B — PARITY, on a copy/retrieval workload.** Same N=4 ring, same ~31.7k-token
+  copy task (reproduce db.ts verbatim → n-gram accepts, mean 5.69/round, g=6.69 tok/traversal), greedy. Only
+  the transport differs (libp2p sidecar / per-node keys / **NO PSK** vs raw-TCP+ChaCha+PSK). **At matched WAN
+  round-trip latency libp2p ≈ raw-TCP within ~1%: libp2p 25.28 tok/s @ recv 246ms vs raw-TCP 25.55 @ recv
+  244ms.** Output **BIT-IDENTICAL** across both transports AND all runs (sha 052193a9…) — the transport is
+  lossless, it changes speed only via WAN latency. WARM libp2p ranged **18.4 → 25.3 → 36.0 tok/s** run-to-run
+  (recv 340 → 246 → 171 ms/round): that spread is **WAN jitter on a cross-country ring, NOT a transport tax**
+  (the apparent first-pair 28% gap was a slow-WAN moment). 6.4–12.6× the old 2.86 cold floor.
+  [receipt](docs/receipts/libp2p-warm-ab-20260624.json).
+
+- **§1b Full proven stack over libp2p (no PSK).** [receipt](docs/receipts/libp2p-fullstack-20260624.json).
+  - **lossless SAMPLING over libp2p — DONE.** temp=0.7 sampled gen 22.69 tok/s, coherent (sha 0ba858e0);
+    `shard/specsample.py` ran unchanged over the sidecar.
+  - **signed per-stage RECEIPTS over libp2p (PROVE) — DONE.** Coordinator swept the ring → 4 signed receipts,
+    every signature **VALID**, in→out activation roots **chain** across stages, coverage [0:36] no gap/overlap —
+    *"coordinator cannot fabricate, no node paid without proving its block."* (receipt.py needs manifest.py on
+    the box — added to the bootstrap set.)
+  - **mid-request KILL → HOT-HEAL → resume over libp2p — MECHANISM IMPLEMENTED + COMPONENTS PROVEN; end-to-end
+    resume not yet completing.** `phase0/heal_hot_libp2p.py`. libp2p needs a different heal than raw-TCP (the
+    pred engine only ever dials its LOCAL sidecar, which survives the victim's death, so the `.shard_next`
+    ip:port rewire never fires): the fix RELAUNCHES the predecessor's sidecar with its ring-forward repointed
+    to the warm spare. PROVEN: pred relinks, pred sidecar makes a DIRECT libp2p connection to the spare, and the
+    spare survives the connection-churn — the latter after fixing a **real engine crash bug** (`specpipe.py`'s
+    bad-message handler referenced `msg` before binding → UnboundLocalError crashed the stage instead of
+    resetting; fixed). REMAINING: the multi-hop re-handshake (head→spare→stage2→tail) doesn't deliver
+    end-to-end over libp2p yet. Fault tolerance ITSELF is proven on raw-TCP (hot-standby, 423 tok preserved,
+    [receipt](docs/receipts/hot-standby-failover-20260623.json)); the engine resume primitive is
+    transport-agnostic — only the libp2p control-plane re-wiring is unfinished.
+
+  New/changed: `launch_libp2p.py` gained `--receipts/--temp/--top-p/--top-k/--seed/--layers`;
+  `phase0/heal_hot_libp2p.py` (new); `specpipe.py` msg-bind robustness fix; `manifest.py` added to the box
+  bootstrap set (a receipt.py dep).
+
 ## 2026-06-23 (session 3) — batched verify (the batching crux) + async inter-stage send (TTFT)
 Fresh N=4 scattered US ring (IL·NV·CA·NJ, 4 distinct 4090 hosts). Two engine items from
 [docs/DEPLOY_READINESS.md](docs/DEPLOY_READINESS.md):

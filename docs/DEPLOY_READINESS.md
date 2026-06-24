@@ -8,6 +8,12 @@ Tags: 🔴 blocking for any honest deploy · 🟡 needed to escape the niche · 
 **E**ngineering (shard repo) · **R**esearch · **I**ntegration (c0mpute repo / not this engine).
 
 ## 1. Latency (what users feel)
+- ✅ **E — WARM libp2p speed measured = PARITY with raw-TCP (2026-06-24).** On a copy/retrieval task over an
+  N=4 scattered US ring, warm libp2p decode ran **18.4–36.0 tok/s** (WAN-RTT dependent, peak 36 @ recv 171ms);
+  at MATCHED WAN round-trip latency **libp2p 25.28 ≈ raw-TCP 25.55 (~1%)**, output **BIT-IDENTICAL**. The
+  libp2p sidecar (per-node keys, Noise, no PSK) adds negligible per-round tax; the tok/s spread is WAN jitter
+  on a genuinely cross-country ring, NOT the transport. Closes the "2.86 cold floor was meaningless" thread.
+  [receipt](receipts/libp2p-warm-ab-20260624.json).
 - ◑ **E — Time-to-first-token at long ctx. ASYNC SEND DONE (2026-06-23); 110k is now compute-bound.** Pipelined
   prefill landed last session (`prefill_depth` chunks in flight) but was handoff-bound at long ctx (synchronous
   24MB/chunk send). **Async inter-stage send now fixes the handoff** (per-stage `_AsyncSender` thread + 32MB socket
@@ -62,6 +68,15 @@ Tags: 🔴 blocking for any honest deploy · 🟡 needed to escape the niche · 
   warm coordinator drops it to ~detect+re-prefill ≈ 13s). [receipt](receipts/hot-standby-failover-20260623.json).
   *Remaining:* "re-prefill of JUST the dropped block" via upstream activation checkpointing (matters at long ctx;
   for a short prompt the full re-prefill is already 8.9s).
+- ◑ **E — HOT-standby failover OVER LIBP2P. MECHANISM DONE, end-to-end resume WIP (2026-06-24).** The hot-heal
+  ported to the real permissionless transport (`phase0/heal_hot_libp2p.py`). libp2p needs a different heal than
+  raw-TCP: the pred engine only ever dials its LOCAL sidecar, which survives the victim's death, so raw-TCP's
+  `.shard_next` ip:port rewire never fires — the fix RELAUNCHES the predecessor's sidecar with its ring-forward
+  repointed to the warm spare. PROVEN: pred relinks + a DIRECT libp2p connection to the spare + the spare
+  survives the churn (after a real `specpipe.py` crash-bug fix: a bad-message handler hit `msg` before binding).
+  REMAINING: the multi-hop re-handshake (head→spare→stage2→tail) doesn't deliver end-to-end over libp2p yet —
+  the libp2p control-plane re-wiring after a live node substitution is the work left. The engine resume
+  primitive itself is transport-agnostic (proven on raw-TCP above). [receipt](receipts/libp2p-fullstack-20260624.json).
 - 🟡 **E — SLA behavior.** Graceful degradation + health so the orchestrator routes around flaky nodes.
 
 ## 4. It's a live permissionless network, not a hand-deployed engine

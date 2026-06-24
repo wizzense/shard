@@ -1,0 +1,62 @@
+{
+  "test": "WARM libp2p vs raw-TCP A/B on a copy/retrieval workload \u2014 the REAL transport speed (closes the 2.86 cold-floor open thread)",
+  "date": "2026-06-24",
+  "model": "gpt-oss-120b (mxfp4)",
+  "ring": "N=4 scattered US 4090s, even 9-layer split: MN(head)->IL->MI->TX (Minnesota/Illinois/Michigan/Texas, 4 distinct hosts), 48GB WA spare",
+  "workload": "copy/retrieval \u2014 reproduce a ~31.7k-token codebase file (db.ts) VERBATIM; model-free n-gram spec-decode engages (mean accept 5.69/round, g=6.69 tok/traversal)",
+  "config": "K=16 depth=2 ngram-n=3 reasoning=low max-ctx=40960 prefill-chunk=4096 max-new=256, greedy (temp=0)",
+  "method": "SAME ring, SAME ~31.7k copy prompt, SAME config; only the transport differs (libp2p sidecar / per-node keys / no PSK  vs  raw-TCP + ChaCha+PSK). Decode tok/s tracks the per-round WAN round-trip (recv_ms_round); the n-gram nets g=6.69 tok per round.",
+  "headline": "WARM libp2p decode on the copy task ran 18.4-36.0 tok/s across runs (peak 36.0 tok/s, recv 171ms/round) \u2014 6.4-12.6x the old 2.86 COLD floor \u2014 with BIT-IDENTICAL output to raw-TCP and to itself; the spread is WAN RTT, not the transport.",
+  "warm_peak_tok_s": 36.02,
+  "parity": {
+    "verdict": "PARITY \u2014 at matched WAN round-trip latency the libp2p sidecar adds ~0 tax (1.1% of raw-TCP)",
+    "libp2p_tok_s_matched_rtt": 25.28,
+    "libp2p_recv_ms": 246,
+    "raw_tcp_tok_s_matched_rtt": 25.55,
+    "raw_tcp_recv_ms": 244,
+    "note": "the per-round latency (recv_ms_round) is the clean transport metric: 246ms (libp2p) vs 244ms (raw-TCP) \u2014 the localhost sidecar relays + Noise add a couple ms, swamped by the ~245ms cross-country WAN round-trip."
+  },
+  "wan_jitter_caveat": "ONE libp2p sample read 18.43 tok/s at recv=340ms \u2014 a slow-WAN MOMENT, not a transport tax: the same ring/transport later read 25.28 at recv=246ms. WAN RTT on a genuinely scattered MN-IL-MI-TX ring drifts ~245-340ms/round run-to-run; that spread (not the sidecar) dominates the tok/s variance. The matched-RTT comparison above is the honest A/B.",
+  "samples": [
+    {
+      "run": "libp2p greedy (slow-WAN sample)",
+      "tok_s": 18.43,
+      "recv_ms_round": 340,
+      "sha": "052193a9e6de"
+    },
+    {
+      "run": "libp2p greedy + receipts (matched RTT)",
+      "tok_s": 25.28,
+      "recv_ms_round": 246,
+      "sha": "052193a9e6de"
+    },
+    {
+      "run": "libp2p greedy + receipts (warm, fast-WAN sample)",
+      "tok_s": 36.02,
+      "recv_ms_round": 171,
+      "sha": "052193a9e6de"
+    },
+    {
+      "run": "raw-TCP greedy (matched RTT)",
+      "tok_s": 25.55,
+      "recv_ms_round": 244,
+      "sha": "052193a9e6de"
+    }
+  ],
+  "output_bit_identical_across_transports_and_runs": true,
+  "output_sha256": "052193a9e6de00bc7247e6ee06784e78b2a03f311ec06c2e60e06dfd04180285",
+  "cold_floor_demolished": "2.86 tok/s (2026-06-23) was a COLD 3-stage / n-gram-accept=0 generative prompt \u2014 meaningless. The real WARM copy-task regime over libp2p is ~25 tok/s.",
+  "prompt_tokens": 31750,
+  "output_tokens": 268,
+  "honest_notes": [
+    "Absolute tok/s is bounded by the cross-country WAN round-trip (~245ms/round over 4 hops), NOT by the transport choice; a tighter/closer ring decodes faster.",
+    "Output is bit-identical across BOTH transports AND runs (greedy + n-gram is deterministic) \u2014 the transport is lossless: it changes speed only via WAN latency, never the result.",
+    "libp2p = per-node ed25519 keys, Noise-encrypted, NO SHARD_PSK \u2014 the permissionless transport, at raw-TCP parity."
+  ],
+  "files": [
+    "phase0/launch_libp2p.py",
+    "phase0/launch_ngram.py",
+    "shard/transport.py",
+    "sidecar/main.go"
+  ]
+}

@@ -72,14 +72,16 @@ def launch_sidecar(inst, announce, inbound, forwards):
     return False
 
 
-def launch_engine(inst, stage, nstages, served_head, max_ctx, timeout, sync_send, model):
+def launch_engine(inst, stage, nstages, served_head, max_ctx, timeout, sync_send, model, receipts=False, lo=-1, hi=-1):
     head = " --served-head" if served_head else ""
     nxt = f" --next 127.0.0.1:{FWD_RING}" if stage < nstages - 1 else ""
-    env = f"SHARD_TRANSPORT=libp2p" + (" SHARD_SYNC_SEND=1" if sync_send else "")
+    lohi = f" --lo {lo} --hi {hi}" if lo >= 0 else ""        # explicit (uneven, VRAM-aware) split; else even
+    env = (f"SHARD_TRANSPORT=libp2p" + (" SHARD_SYNC_SEND=1" if sync_send else "")
+           + (" SHARD_RECEIPTS=1" if receipts else ""))
     cmd = (f"nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -r kill -9 2>/dev/null; "
            f"fuser -k {ENG_IN}/tcp 2>/dev/null; sleep 6; rm -f /root/stage.log /root/.shard_next_*; cd /root && "
            f"{env} setsid bash -c 'python3 specpipe.py --stage {stage} --nstages {nstages} --model {model} "
-           f"--listen-port {ENG_IN}{nxt}{head} --fast --direct-return --max-ctx {max_ctx} "
+           f"--listen-port {ENG_IN}{nxt}{head} --fast --direct-return --max-ctx {max_ctx}{lohi} "
            f"--timeout {timeout} > /root/stage.log 2>&1' </dev/null >/dev/null 2>&1 &")
     fire(inst, cmd)
 
@@ -87,6 +89,7 @@ def launch_engine(inst, stage, nstages, served_head, max_ctx, timeout, sync_send
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--stages", required=True, help="comma ids, head first")
+    ap.add_argument("--layers", default="", help="per-stage layer counts e.g. 18,9,9 (sum=layer_count); else even split")
     ap.add_argument("--model", default=M120, help="model path on the boxes (default the 120B; M20 for the 20B)")
     ap.add_argument("--max-ctx", type=int, default=16384)
     ap.add_argument("--prompt-file", default="/root/ft_prompt.txt")
@@ -98,11 +101,27 @@ def main():
     ap.add_argument("--max-new", type=int, default=64)
     ap.add_argument("--edge-timeout", type=int, default=1200)
     ap.add_argument("--sync-send", action="store_true", help="SHARD_SYNC_SEND=1 baseline (A/B over libp2p)")
+    ap.add_argument("--receipts", action="store_true", help="SHARD_RECEIPTS=1: each stage signs a per-block receipt; "
+                    "the coordinator sweeps the ring after gen, verifies every signature + full layer coverage (PROVE over libp2p)")
+    ap.add_argument("--temp", type=float, default=0.0, help="sampling temperature (0=greedy/exact; >0=lossless spec-sampling)")
+    ap.add_argument("--top-p", type=float, default=1.0)
+    ap.add_argument("--top-k", type=int, default=0)
+    ap.add_argument("--seed", type=int, default=0, help="tail sampler seed (reproducible sampled runs)")
     ap.add_argument("--no-launch", action="store_true", help="ring already up; just run the coordinator")
     a = ap.parse_args()
     sids = [int(x) for x in a.stages.split(",")]
     insts = instances(); stages = [insts[i] for i in sids]; nstages = len(stages)
     head, tail = stages[0], stages[-1]
+    # per-stage [lo, hi): explicit (uneven, VRAM-aware) or even (specpipe derives it from -1)
+    if a.layers:
+        counts = [int(x) for x in a.layers.split(",")]
+        assert len(counts) == nstages, "layers count must match nstages"
+        b = [0]
+        for c in counts:
+            b.append(b[-1] + c)
+        lohis = [(b[k], b[k + 1]) for k in range(nstages)]
+    else:
+        lohis = [(-1, -1)] * nstages
 
     if not a.no_launch:
         print("[libp2p] collecting PeerIds ...", flush=True)
@@ -127,7 +146,8 @@ def main():
             ok = False
             for attempt in range(2):
                 launch_engine(stages[k], k, nstages, served_head=(k == 0), max_ctx=a.max_ctx,
-                              timeout=a.edge_timeout, sync_send=a.sync_send, model=a.model)
+                              timeout=a.edge_timeout, sync_send=a.sync_send, model=a.model, receipts=a.receipts,
+                              lo=lohis[k][0], hi=lohis[k][1])
                 _, ok = warm_stage(stages[k], f"stage{k} {stages[k]['id']}")
                 if ok:
                     break
@@ -141,10 +161,12 @@ def main():
     # coordinator on the head: --next = head engine (local), --tail = head sidecar ret-forward
     print("[libp2p] running n-gram coordinator on head ...", flush=True)
     sync = " SHARD_SYNC_SEND=1" if a.sync_send else ""
-    cmd = (f"cd /root && SHARD_TRANSPORT=libp2p{sync} python3 specpipe.py --coordinator --nstages {nstages} "
+    renv = " SHARD_RECEIPTS=1" if a.receipts else ""
+    smpl = f" --temp {a.temp} --top-p {a.top_p} --top-k {a.top_k} --seed {a.seed}" if a.temp > 0 else ""
+    cmd = (f"cd /root && SHARD_TRANSPORT=libp2p{sync}{renv} python3 specpipe.py --coordinator --nstages {nstages} "
            f"--model {a.model} --ngram-draft --ngram-n {a.ngram_n} --pipe --depth {a.depth} --K {a.K} "
            f"--next 127.0.0.1:{ENG_IN} --direct-return --tail 127.0.0.1:{FWD_RET} --prompt-file {a.prompt_file} "
-           f"--prefill-chunk {a.prefill_chunk} --max-ctx {a.max_ctx} --max-new {a.max_new} "
+           f"--prefill-chunk {a.prefill_chunk} --max-ctx {a.max_ctx} --max-new {a.max_new}{smpl} "
            f"--reasoning {a.reasoning} --timeout {a.edge_timeout} --dump /root/run.json 2>&1 | grep -viE 'INFO|WARNING|warn'")
     r = rssh(head, cmd, timeout=a.edge_timeout + 600)
     print(r.stdout[-3000:], flush=True)
