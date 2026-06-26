@@ -1,0 +1,312 @@
+"""MiniMax-M2.5 PIPELINED ring — direct-return stages + the PROVEN coordinate_pipe coordinator.
+
+The lean m25_ring driver was synchronous (one ring traversal at a time), so every token paid the
+full ~280ms ring latency. specpipe.coordinate_pipe keeps `depth` verify chunks IN FLIGHT (the GLM
+2.9->16.6 lever) and is model-agnostic — it only orchestrates token-ids + argmax over sockets, with
+a pluggable n-gram drafter. So we reuse it UNCHANGED and only provide M2.5-native stage serve loops
+that speak its wire protocol: reset / verify(token_ids|h, start). The KV is purely start-based — a
+fresh chunk at an earlier `start` overwrites stale speculative KV — which is EXACTLY m25_stage's
+crop-to-start behaviour, so rollback needs no extra bookkeeping. Direct-return: middle stages
+fire-forward, the tail returns straight to the coordinator (serve_tail_direct's 2-connection model).
+
+  stage:  SHARD_TRANSPORT=libp2p M25_DIR=/root/m25 python m25_pipe.py stage --stage 0 --nstages 5 \
+              --lo 0 --hi 10 --port 29610 --next 127.0.0.1:29611
+  coord:  SHARD_TRANSPORT=libp2p M25_DIR=/root/m25 python m25_pipe.py coord --head 127.0.0.1:29610 \
+              --tail 127.0.0.1:29612 --K 6 --depth 4 --max-new 256 --prompt-file p.txt
+"""
+import os, sys, socket, select, time, argparse, hashlib, torch
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+os.environ.setdefault("M25_DIR", "/root/m25")
+import json
+import m25_stage as S
+from m25_tools import render_ids, parse_completion          # tool-calling: chat-template render + output parse
+from node_kv import send_msg, recv_msg, EDGE_ERRORS, TransportError   # libp2p codec (SHARD_TRANSPORT=libp2p)
+
+dev = "cuda"
+NODELAY = (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+try:                                                    # PROVE: opt-in signed per-stage receipts (trustless verify)
+    from receipt import ReceiptSigner, load_or_make_node_key, verify_receipt, verify_coverage
+except Exception:
+    ReceiptSigner = None
+RECEIPTS = bool(os.environ.get("SHARD_RECEIPTS")) and ReceiptSigner is not None
+NODE_KEY_PATH = os.environ.get("SHARD_NODE_KEY", "/root/.shard_node_key")
+
+
+def _act_digest(t):
+    """Deterministic byte digest of an activation tensor for the receipt hash-chain (fp16 bytes)."""
+    return t.detach().to(torch.float16).contiguous().cpu().numpy().tobytes()
+
+
+def _verify_receipts(receipts):
+    """Coordinator-side PROVE: every per-stage receipt's signature must verify AND the blocks must
+    tile [0:layer_count] with no gap/overlap — so no node is paid without proving its own block and
+    the coordinator cannot fabricate one. Returns True/False (fails closed). Prints a per-stage line."""
+    bodies = [{k: v for k, v in rr.items() if k != "stage"} for rr in receipts]
+    ok = True
+    for rr, body in zip(receipts, bodies):
+        try:
+            verify_receipt(body)
+            print(f"  stage {rr.get('stage')}: layers[{body['layer_start']}:{body['layer_end']}] "
+                  f"n={body['n_chunks']} in_root {body['in_root'][:12]} out_root {body['out_root'][:12]} "
+                  f"pub {body['pubkey'][:12]} — sig VALID", flush=True)
+        except Exception as e:
+            ok = False; print(f"  stage {rr.get('stage')}: sig FAILED ({e})", flush=True)
+    try:
+        verify_coverage(bodies, max(b["layer_end"] for b in bodies))
+    except Exception as e:
+        ok = False; print(f"  coverage FAILED: {e}", flush=True)
+    return ok
+
+
+def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_sock, local_draft,
+                    tools=None, prefill_chunk=4096, max_ctx=0, prefill_depth=8, on_commit=None,
+                    swarm_id="swarm", job_id="job"):
+    """PIPELINED coordinator copied verbatim from specpipe.coordinate_pipe (n-gram local_draft path,
+    greedy, direct-return) — keep `depth` verify chunks in flight so throughput approaches the ring's
+    per-chunk THROUGHPUT, not its full latency (the GLM 2.9->16.6 lever). Self-contained: only sockets
+    + the drafter + tokenizer. eos handled as int-or-list for M2.5."""
+    pipe_sock.settimeout(timeout)
+    rx = ret_sock if ret_sock is not None else pipe_sock
+    def d_request(ids, k): local_draft.request(ids, k)
+    def d_fetch(): return local_draft.fetch()
+    _eos = tok.eos_token_id
+    eos_set = set(_eos) if isinstance(_eos, (list, tuple)) else {_eos}
+    prompt_ids = render_ids(tok, messages, tools=tools)     # chat-template + tools injection (m25_tools)
+    gen_ids = list(prompt_ids)
+    if max_ctx:
+        max_new = max(16, min(max_new, max_ctx - len(gen_ids) - 16))
+    out = []; t_draft = t_recv = 0.0; prefill_s = 0.0; receipts = []
+    try:
+        send_msg(pipe_sock, {"op": "reset", "temp": 0.0, "top_p": 1.0, "top_k": 0, "seed": 0,
+                             "swarm_id": swarm_id, "job_id": job_id}); recv_msg(rx)
+        t_pf = time.time()
+        if prefill_chunk and len(gen_ids) > prefill_chunk:
+            starts = list(range(0, len(gen_ids), prefill_chunk))
+            def _send_pf(i): send_msg(pipe_sock, {"op": "verify", "token_ids": gen_ids[i:i + prefill_chunk], "start": i, "prefill": True})
+            d = min(max(prefill_depth, 1), len(starts)); sent = 0; rr = None
+            while sent < d: _send_pf(starts[sent]); sent += 1
+            for _ in range(len(starts)):
+                rr = recv_msg(rx)
+                if sent < len(starts): _send_pf(starts[sent]); sent += 1
+            cur = rr[-1]
+        else:
+            send_msg(pipe_sock, {"op": "verify", "token_ids": gen_ids, "start": 0}); cur = recv_msg(rx)[-1]
+        prefill_s = time.time() - t_pf
+        pos = len(gen_ids); out = [cur]
+        if on_commit: on_commit(out, 0.0)               # stream: first token from prefill
+        inflight = []; discard = 0; send_pos = pos; dprefix = gen_ids + [cur]
+        valid = accepted = wasted = 0; t0 = time.time(); done = False
+        d_request(dprefix, K)
+        while not done:
+            while len(inflight) < depth and not done:
+                td = time.time(); ds = d_fetch(); t_draft += time.time() - td
+                send_msg(pipe_sock, {"op": "verify", "token_ids": [dprefix[-1]] + ds, "start": send_pos})
+                inflight.append((send_pos, ds)); dprefix = dprefix + ds; send_pos += K
+                d_request(dprefix, K)
+            tr = time.time(); r = recv_msg(rx); t_recv += time.time() - tr
+            sp, ds = inflight.pop(0)
+            if discard > 0: discard -= 1; wasted += 1; continue
+            n = 0
+            for j in range(K):
+                if ds[j] == r[j]: n += 1
+                else: break
+            valid += 1; accepted += n
+            if n == K:
+                out.extend(ds); pos += K; cur = ds[-1]; committed = ds
+            else:
+                committed = ds[:n] + [r[n]]; out.extend(committed); cur = r[n]; pos += n + 1
+                discard = len(inflight); d_fetch(); dprefix = prompt_ids + out; send_pos = pos; d_request(dprefix, K)
+            if on_commit: on_commit(out, time.time() - t0)   # stream: this commit's running output
+            if len(out) >= max_new or (cur in eos_set) or (eos_set & set(committed)): done = True
+        d_fetch()
+        while inflight: recv_msg(rx); inflight.pop(0)
+        if RECEIPTS:                                        # PROVE: sweep the ring once for signed per-stage receipts
+            send_msg(pipe_sock, {"op": "receipt", "receipts": []}); receipts = recv_msg(rx)
+    except EDGE_ERRORS as e:
+        raise TransportError(f"pipeline edge failed at token {len(out)} ({type(e).__name__}: {e})") from e
+    dt = time.time() - t0
+    for ee in eos_set:
+        if ee in out: out = out[:out.index(ee)]; break
+    receipts_ok = _verify_receipts(receipts) if receipts else None
+    return {"ok": True, "text": tok.decode(out, skip_special_tokens=True), "n_tokens": len(out), "rounds": valid,
+            "mean_accept": accepted / max(valid, 1), "toks_per_traversal": (accepted + valid) / max(valid, 1),
+            "tok_s": len(out) / max(dt, 1e-9), "wasted": wasted, "prefill_s": prefill_s, "output_ids": out,
+            "prompt_tokens": len(prompt_ids), "receipts": receipts, "receipts_ok": receipts_ok}
+
+
+def _load(stage, nstages, lo, hi):
+    S.vllm_ctx()
+    layers = [S.Layer(i) for i in range(lo, hi)]
+    parts = {"layers": layers, "head": stage == 0, "tail": stage == nstages - 1}
+    if parts["head"]:
+        parts["embed_w"] = S.raw("model.embed_tokens.weight").to(torch.bfloat16).to(dev)
+    if parts["tail"]:
+        parts["norm_w"] = S.raw("model.norm.weight").float().to(dev)
+        parts["lm_head_w"] = S.raw("lm_head.weight").to(torch.bfloat16).to(dev)
+    print(f"[s{stage}] loaded layers [{lo}:{hi}] ({torch.cuda.memory_allocated()/1e9:.1f}GB) — warming", flush=True)
+    with torch.no_grad():
+        S.run_block(layers, 0, torch.randn(1, 4, S.H, dtype=torch.bfloat16, device=dev) * 0.1, S._CTX[1])
+        for L in layers:
+            L.reset()
+    torch.cuda.synchronize()
+    return parts
+
+
+def _tail_logits(h, parts):
+    x = h.float()
+    x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + S.EPS) * parts["norm_w"]
+    return (x.to(torch.bfloat16) @ parts["lm_head_w"].t())   # [1, s, vocab]
+
+
+def serve(stage, nstages, lo, hi, port, nxt, timeout):
+    parts = _load(stage, nstages, lo, hi)
+    layers = parts["layers"]
+    vcfg = S._CTX[1]
+    nxt_sock = None
+    if not parts["tail"]:
+        host, p = nxt.rsplit(":", 1)
+        nxt_sock = socket.socket(); nxt_sock.settimeout(timeout); nxt_sock.connect((host, int(p)))
+        nxt_sock.setsockopt(*NODELAY)
+        print(f"[s{stage}] forward connected -> {nxt}", flush=True)
+    srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", port)); srv.listen(2)
+    print(f"[s{stage}] WARM, listening :{port}", flush=True)
+
+    if parts["tail"]:
+        node_key = load_or_make_node_key(NODE_KEY_PATH) if RECEIPTS else None
+        # serve_tail_direct: predecessor (ring) + coordinator-return (hello_return) connections
+        while True:
+            c1, _ = srv.accept(); c2, _ = srv.accept()
+            ready, _, _ = select.select([c1, c2], [], [], timeout)
+            if not ready:
+                c1.close(); c2.close(); continue
+            ret = ready[0]
+            try:
+                hello = recv_msg(ret)
+            except EDGE_ERRORS:
+                c1.close(); c2.close(); continue
+            if not (isinstance(hello, dict) and hello.get("op") == "hello_return"):
+                c1.close(); c2.close(); continue
+            pred = c2 if ret is c1 else c1
+            pred.settimeout(timeout); ret.setsockopt(*NODELAY); pred.setsockopt(*NODELAY)
+            send_msg(ret, "ret_ok")          # confirm the ret channel BEFORE any reset can race into pred's select
+            print("[tail] predecessor + coord-return connected", flush=True)
+            signer = None
+            with torch.no_grad():
+                try:
+                    while True:
+                        msg = recv_msg(pred)
+                        if msg["op"] == "reset":
+                            for L in layers:
+                                L.reset()
+                            if RECEIPTS:                    # start this job's per-stage activation hash-chain
+                                signer = ReceiptSigner(node_key, msg.get("swarm_id", "swarm"),
+                                                       msg.get("job_id", "job"), lo, hi)
+                            send_msg(ret, "ok"); continue
+                        if msg["op"] == "receipt":          # job done: sign + return the full ring's receipts
+                            if RECEIPTS and signer is not None:
+                                msg.setdefault("receipts", []).append({"stage": "tail", **signer.finalize()})
+                            send_msg(ret, msg.get("receipts", [])); continue
+                        x = msg["h"].to(dev)
+                        h = S.run_block(layers, msg["start"], x, vcfg)
+                        if RECEIPTS and signer is not None:   # attest this block's input->output transform
+                            signer.observe(_act_digest(x), _act_digest(h))
+                        toks = _tail_logits(h, parts).argmax(-1)[0].tolist()
+                        send_msg(ret, toks)
+                except EDGE_ERRORS as e:
+                    print(f"[tail] edge closed ({type(e).__name__}); reset", flush=True)
+                    for L in layers:
+                        L.reset()
+                    try: pred.close(); ret.close()
+                    except OSError: pass
+        return
+
+    # head / middle: single predecessor connection, FIRE-FORWARD (direct mode, no relay-back)
+    node_key = load_or_make_node_key(NODE_KEY_PATH) if RECEIPTS else None
+    while True:
+        conn, _ = srv.accept(); conn.setsockopt(*NODELAY)
+        print(f"[s{stage}] predecessor connected", flush=True)
+        signer = None
+        with torch.no_grad():
+            try:
+                while True:
+                    msg = recv_msg(conn)
+                    if msg["op"] == "reset":
+                        for L in layers:
+                            L.reset()
+                        if RECEIPTS:                            # start this job's per-stage activation hash-chain
+                            signer = ReceiptSigner(node_key, msg.get("swarm_id", "swarm"),
+                                                   msg.get("job_id", "job"), lo, hi)
+                        send_msg(nxt_sock, msg); continue       # propagate reset down the chain
+                    if msg["op"] == "receipt":                  # job done: sign + accumulate forward to the tail
+                        if RECEIPTS and signer is not None:
+                            msg.setdefault("receipts", []).append({"stage": stage, **signer.finalize()})
+                        send_msg(nxt_sock, msg); continue
+                    if "token_ids" in msg:                      # head: embed the coordinator's token ids
+                        h = torch.nn.functional.embedding(torch.tensor([msg["token_ids"]], device=dev), parts["embed_w"])
+                    else:
+                        h = msg["h"].to(dev)
+                    x = h
+                    h = S.run_block(layers, msg["start"], h, vcfg)
+                    if RECEIPTS and signer is not None:         # attest this block's input->output transform
+                        signer.observe(_act_digest(x), _act_digest(h))
+                    send_msg(nxt_sock, {"op": "verify", "h": h.cpu(), "start": msg["start"]})
+            except EDGE_ERRORS as e:
+                print(f"[s{stage}] edge closed ({type(e).__name__}); reset", flush=True)
+                for L in layers:
+                    L.reset()
+                try: conn.close()
+                except OSError: pass
+
+
+def coord(head_ep, tail_ep, prompt, K, max_new, depth, ngram_n, timeout):
+    from ngram_draft import NgramDrafter
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(S.DIR, trust_remote_code=True)
+    hh, hp = head_ep.rsplit(":", 1); th, tp = tail_ep.rsplit(":", 1)
+    pipe = socket.create_connection((hh, int(hp)), timeout=timeout); pipe.setsockopt(*NODELAY)
+    ret = socket.create_connection((th, int(tp)), timeout=timeout); ret.setsockopt(*NODELAY); ret.settimeout(timeout)
+    send_msg(ret, {"op": "hello_return"})                       # identify the return channel to the tail
+    recv_msg(ret)                                               # wait ret_ok: tail confirmed ret before any reset flows
+    drafter = NgramDrafter(ng=ngram_n)
+    print(f"[coord] pipelined (K={K} depth={depth} ngram={ngram_n}) -> head {head_ep}, ret {tail_ep}", flush=True)
+    messages = [{"role": "user", "content": prompt}]
+    r = coordinate_pipe(pipe, tok, messages, K, max_new, timeout, depth, ret_sock=ret,
+                        local_draft=drafter, tools=None, prefill_chunk=4096, max_ctx=131072)
+    if r.get("ok"):
+        parsed = parse_completion(r["text"])
+        print(f"\n[coord] {r['n_tokens']}tok  {r['tok_s']:.2f} tok/s  g={r['toks_per_traversal']:.2f}  "
+              f"mean_accept={r['mean_accept']:.2f}/{K}  prefill={r['prefill_s']:.2f}s  depth={depth}", flush=True)
+        if parsed["reasoning_content"]:
+            print("[coord] THINK:\n" + parsed["reasoning_content"][:600], flush=True)
+        print("[coord] OUTPUT:\n" + (parsed["content"] or "")[:1200], flush=True)
+        if parsed["tool_calls"]:
+            print("[coord] TOOL_CALLS: " + json.dumps(parsed["tool_calls"], ensure_ascii=False)[:800], flush=True)
+        if r.get("receipts"):
+            print(f"[coord] === PROVE: {len(r['receipts'])} signed per-stage receipts ===", flush=True)
+            print(f"[coord] PROVE verdict: {'ALL receipts valid + full layer coverage' if r.get('receipts_ok') else 'FAILED'}", flush=True)
+        print("SHA:", hashlib.sha256(r["text"].encode()).hexdigest()[:12], flush=True)
+    else:
+        print("[coord] FAILED:", r, flush=True)
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(); sub = ap.add_subparsers(dest="role", required=True)
+    ps = sub.add_parser("stage")
+    ps.add_argument("--stage", type=int, required=True); ps.add_argument("--nstages", type=int, required=True)
+    ps.add_argument("--lo", type=int, required=True); ps.add_argument("--hi", type=int, required=True)
+    ps.add_argument("--port", type=int, default=29610); ps.add_argument("--next", default=None)
+    ps.add_argument("--timeout", type=int, default=600)
+    pc = sub.add_parser("coord")
+    pc.add_argument("--head", required=True); pc.add_argument("--tail", required=True)
+    pc.add_argument("--prompt", default="Explain a decentralized inference swarm in 3 sentences.")
+    pc.add_argument("--prompt-file", default=None); pc.add_argument("--K", type=int, default=6)
+    pc.add_argument("--depth", type=int, default=4); pc.add_argument("--max-new", type=int, default=256)
+    pc.add_argument("--ngram-n", type=int, default=3); pc.add_argument("--timeout", type=int, default=600)
+    a = ap.parse_args()
+    if a.role == "stage":
+        serve(a.stage, a.nstages, a.lo, a.hi, a.port, a.next, a.timeout)
+    else:
+        prompt = open(a.prompt_file).read() if a.prompt_file else a.prompt
+        coord(a.head, a.tail, prompt, a.K, a.max_new, a.depth, a.ngram_n, a.timeout)

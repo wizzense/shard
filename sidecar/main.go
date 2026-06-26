@@ -442,6 +442,9 @@ func runForward(h host.Host, listenAddr, peerMaddr string) {
 			log.Printf("forward accept: %v", err)
 			return
 		}
+		if tc, ok := c.(*net.TCPConn); ok { // small ping-pong messages: Nagle stalls each hop ~10-40ms
+			tc.SetNoDelay(true)
+		}
 		go func() {
 			s, err := openStream(h, peerMaddr)
 			if err != nil {
@@ -463,6 +466,9 @@ func runInbound(h host.Host, engineAddr string) {
 			log.Printf("inbound -> engine %s: %v", engineAddr, err)
 			s.Reset()
 			return
+		}
+		if tc, ok := c.(*net.TCPConn); ok { // disable Nagle: the relay-back is small ping-pong messages
+			tc.SetNoDelay(true)
 		}
 		pipe(s, c)
 	})
