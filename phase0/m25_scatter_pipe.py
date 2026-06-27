@@ -59,11 +59,12 @@ def launch_sidecar(host, port, announce, inbound, forwards):
     return False
 
 
-def launch_stage(host, port, stage, nstages, lo, hi, is_tail):
+def launch_stage(host, port, stage, nstages, lo, hi, is_tail, receipts=False):
     nxt = "" if is_tail else f"--next 127.0.0.1:{FWD_RING}"
+    rc = "SHARD_RECEIPTS=1 " if receipts else ""
     cmd = (f"nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -r kill -9 2>/dev/null; "
            f"fuser -k {ENG_IN}/tcp 2>/dev/null; sleep 4; rm -f /root/stage.log; cd /root && "
-           f"SHARD_TRANSPORT=libp2p CUDA_VISIBLE_DEVICES=0 M25_DIR=/root/m25 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True setsid bash -c "
+           f"{rc}SHARD_TRANSPORT=libp2p CUDA_VISIBLE_DEVICES=0 M25_DIR=/root/m25 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True setsid bash -c "
            f"'/root/venv/bin/python /root/m25_pipe.py stage --stage {stage} --nstages {nstages} --lo {lo} --hi {hi} "
            f"--port {ENG_IN} {nxt} > /root/stage.log 2>&1' </dev/null >/dev/null 2>&1 &")
     try:
@@ -94,6 +95,7 @@ def main():
     ap.add_argument("--prompt-file", default=None)
     ap.add_argument("--sweep", default=None); ap.add_argument("--sweep-depth", default=None)  # pass through to coord
     ap.add_argument("--prefill-chunk", type=int, default=512)
+    ap.add_argument("--validate", action="store_true"); ap.add_argument("--receipts", action="store_true")
     a = ap.parse_args()
     nodes = []
     for spec in a.order:
@@ -128,7 +130,7 @@ def main():
 
     print("[pipe] stages tail-first ...", flush=True)
     for k in range(n - 1, -1, -1):
-        launch_stage(nodes[k]["host"], nodes[k]["port"], k, n, nodes[k]["lo"], nodes[k]["hi"], k == n - 1)
+        launch_stage(nodes[k]["host"], nodes[k]["port"], k, n, nodes[k]["lo"], nodes[k]["hi"], k == n - 1, a.receipts)
     for k in range(n - 1, -1, -1):
         ok = warm(nodes[k]["host"], nodes[k]["port"], f"s{k} {nodes[k]['region']}")
         print(f"  {'WARM' if ok else 'FAIL'} s{k} {nodes[k]['region']}", flush=True)
@@ -137,12 +139,13 @@ def main():
 
     head = nodes[0]
     pf = f"--prompt-file {a.prompt_file}" if a.prompt_file else f'--prompt "{a.prompt}"'
-    sw = (f"--sweep {a.sweep} " if a.sweep else "") + (f"--sweep-depth {a.sweep_depth} " if a.sweep_depth else "")
+    sw = (f"--sweep {a.sweep} " if a.sweep else "") + (f"--sweep-depth {a.sweep_depth} " if a.sweep_depth else "") + ("--validate " if a.validate else "")
+    rc = "SHARD_RECEIPTS=1 " if a.receipts else ""
     print("[pipe] coordinator (pipelined) on head ...", flush=True)
-    cmd = (f"cd /root && SHARD_TRANSPORT=libp2p CUDA_VISIBLE_DEVICES=0 M25_DIR=/root/m25 /root/venv/bin/python /root/m25_pipe.py coord "
+    cmd = (f"cd /root && {rc}SHARD_TRANSPORT=libp2p CUDA_VISIBLE_DEVICES=0 M25_DIR=/root/m25 /root/venv/bin/python /root/m25_pipe.py coord "
            f"--head 127.0.0.1:{ENG_IN} --tail 127.0.0.1:{FWD_RET} --K {a.K} --depth {a.depth} --ngram-n {a.ngram_n} "
-           f"--max-new {a.max_new} --prefill-chunk {a.prefill_chunk} {sw}{pf} 2>&1 | grep -vE 'INFO|WARNING|warn|instantiate'")
-    r = sh(head["host"], head["port"], cmd, timeout=1800 if (a.sweep or a.sweep_depth) else 1200)
+           f"--max-new {a.max_new} --prefill-chunk {a.prefill_chunk} {sw}{pf} 2>&1 | tee /root/coord.log | grep -vE 'INFO|WARNING|warn|instantiate'")
+    r = sh(head["host"], head["port"], cmd, timeout=1800 if (a.sweep or a.sweep_depth or a.validate) else 1200)
     print(r.stdout, flush=True)
     if r.stderr.strip():
         print("[stderr]", r.stderr[-700:], flush=True)

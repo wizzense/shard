@@ -280,17 +280,64 @@ def _sweep_summary(rows):
     return "\n".join(lines), best
 
 
-def _run_job(pipe, ret, tok, messages, k, max_new, timeout, d, ngram_n, prefill_chunk):
+def _run_job(pipe, ret, tok, messages, k, max_new, timeout, d, ngram_n, prefill_chunk, tools=None):
     """One coordinate_pipe job with a FRESH drafter (clean n-gram state per config). Sockets are
-    reused across sweep configs — coordinate_pipe drains in-flight + opens each job with `reset`,
-    which clears every stage's KV, so back-to-back jobs on the same ring are clean."""
+    reused across jobs — coordinate_pipe drains in-flight + opens each job with `reset`, which clears
+    every stage's KV, so back-to-back jobs on the same ring are clean."""
     from ngram_draft import NgramDrafter
     drafter = NgramDrafter(ng=ngram_n)
     return coordinate_pipe(pipe, tok, messages, k, max_new, timeout, d, ret_sock=ret,
-                           local_draft=drafter, tools=None, prefill_chunk=prefill_chunk, max_ctx=131072)
+                           local_draft=drafter, tools=tools, prefill_chunk=prefill_chunk, max_ctx=131072)
 
 
-def coord(head_ep, tail_ep, prompt, K, max_new, depth, ngram_n, timeout, sweep=None, sweep_depth=None, prefill_chunk=512):
+def _validate(pipe, ret, tok, K, depth, ngram_n, prefill_chunk, timeout, longctx_path):
+    """FULL usability pass on ONE warm ring (jobs reuse the socket like the sweep). Exercises every
+    deploy-ready capability end-to-end over libp2p and prints a PASS/FAIL per capability. Receipts are
+    proven on every job when the ring was launched with SHARD_RECEIPTS=1."""
+    WEATHER = [{"type": "function", "function": {"name": "get_weather",
+                "description": "Get the current weather for a city",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "city name"}},
+                               "required": ["city"]}}}]
+
+    print("\n[validate] === FULL USABILITY PASS (warm, libp2p) ===", flush=True)
+
+    # 1) TOOL CALLING — model must emit a structured get_weather call
+    m = [{"role": "user", "content": "Use the get_weather tool to check the weather in Paris."}]
+    r = _run_job(pipe, ret, tok, m, K, 256, timeout, depth, ngram_n, prefill_chunk, tools=WEATHER)
+    p = parse_completion(r["text"]); tc = p["tool_calls"]
+    print(f"[validate] 1.TOOLS      {'PASS' if tc else 'FAIL'}  tool_calls={json.dumps(tc, ensure_ascii=False)[:220]}  "
+          f"receipts_ok={r.get('receipts_ok')}  {r['tok_s']:.1f}tok/s", flush=True)
+
+    # 2) EXTENDED CONVO — a real ~9-turn back-and-forth; final turn must RECALL a fact stated in turn 1
+    #    (tests render_ids threading a long history + cross-turn recall, the "long convo" usability dimension)
+    m = [{"role": "user", "content": "Hey, I'm setting up a decentralized inference swarm. My node ID is SWARM-NODE-4417 and I'm running 5 RTX 5090s scattered across Europe."},
+         {"role": "assistant", "content": "Nice — 5x5090 scattered across Europe is a solid ring. What model are you serving on it?"},
+         {"role": "user", "content": "MiniMax-M2.5, sharded across the nodes over libp2p. I'm getting about 20 tokens per second warm."},
+         {"role": "assistant", "content": "That's a healthy warm number for a 5-stage pipeline over WAN. Are you using speculative decoding to hide the per-hop latency?"},
+         {"role": "user", "content": "Yeah, n-gram drafting — works great on copy and retrieval tasks. I also need tool calling and long context to work."},
+         {"role": "assistant", "content": "Both are supported: the coordinator threads tools through the chat template, and chunked prefill handles long context without OOM."},
+         {"role": "user", "content": "Good. I'm also worried about trusting the nodes I don't control."},
+         {"role": "assistant", "content": "Each node signs a per-stage receipt with its own key and the coordinator verifies full layer coverage, so no node is paid without proving its block."},
+         {"role": "user", "content": "Perfect. Now remind me — what was the node ID I gave you at the very start, and how many GPUs did I say I'm running?"}]
+    r = _run_job(pipe, ret, tok, m, K, 96, timeout, depth, ngram_n, prefill_chunk, tools=None)
+    p = parse_completion(r["text"]); ans = (p["content"] or "").strip()
+    recall = ("SWARM-NODE-4417" in ans) and ("5" in ans)
+    print(f"[validate] 2.CONVO(9-turn) {'PASS (recalled turn-1 facts)' if recall else 'PARTIAL/FAIL'}  "
+          f"answer={ans[:200]!r}  receipts_ok={r.get('receipts_ok')}", flush=True)
+
+    # 3) LONG CONTEXT — needle retrieval far past the old 8192 RoPE cap (proves the rope fix + chunked prefill)
+    lc = open(longctx_path).read()
+    m = [{"role": "user", "content": lc}]
+    r = _run_job(pipe, ret, tok, m, K, 24, timeout, depth, ngram_n, prefill_chunk, tools=None)
+    p = parse_completion(r["text"]); ans = (p["content"] or r["text"]).strip()
+    hit = "ZX-PAYLOAD-7731" in ans
+    print(f"[validate] 3.LONG-CTX   {'PASS (needle found)' if hit else 'FAIL'}  prompt_tokens={r['prompt_tokens']}  "
+          f"prefill={r['prefill_s']:.1f}s  answer={ans[:80]!r}  receipts_ok={r.get('receipts_ok')}", flush=True)
+
+    print("[validate] === END ===", flush=True)
+
+
+def coord(head_ep, tail_ep, prompt, K, max_new, depth, ngram_n, timeout, sweep=None, sweep_depth=None, prefill_chunk=512, validate=False):
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(S.DIR, trust_remote_code=True)
     hh, hp = head_ep.rsplit(":", 1); th, tp = tail_ep.rsplit(":", 1)
@@ -299,6 +346,10 @@ def coord(head_ep, tail_ep, prompt, K, max_new, depth, ngram_n, timeout, sweep=N
     send_msg(ret, {"op": "hello_return"})                       # identify the return channel to the tail
     recv_msg(ret)                                               # wait ret_ok: tail confirmed ret before any reset flows
     messages = [{"role": "user", "content": prompt}]
+
+    if validate:                                               # full usability pass (tools+multi-turn+long-ctx+receipts)
+        _validate(pipe, ret, tok, K, depth, ngram_n, prefill_chunk, timeout, "/root/longctx_prompt.txt")
+        return
 
     if sweep or sweep_depth:                                    # K/depth throughput sweep -> tok/s table
         Ks = sweep or [K]; Ds = sweep_depth or [depth]
@@ -358,6 +409,7 @@ if __name__ == "__main__":
     pc.add_argument("--sweep", default=None, help="comma K list, e.g. 4,6,8,12,16 (drafter margin is safe to K<=16)")
     pc.add_argument("--sweep-depth", default=None, help="comma depth list, e.g. 2,4,8 (default: --depth)")
     pc.add_argument("--prefill-chunk", type=int, default=512, help="prefill tokens per ring traversal; bounds the O(s^2) attn matrix so a long prompt doesn't OOM a memory-tight stage")
+    pc.add_argument("--validate", action="store_true", help="full usability pass: tools + multi-turn + long-ctx (needle) + receipts, one warm ring")
     a = ap.parse_args()
 
     def _ilist(s): return [int(x) for x in s.split(",") if x.strip()] if s else None
@@ -367,4 +419,4 @@ if __name__ == "__main__":
     else:
         prompt = open(a.prompt_file).read() if a.prompt_file else a.prompt
         coord(a.head, a.tail, prompt, a.K, a.max_new, a.depth, a.ngram_n, a.timeout,
-              sweep=_ilist(a.sweep), sweep_depth=_ilist(a.sweep_depth), prefill_chunk=a.prefill_chunk)
+              sweep=_ilist(a.sweep), sweep_depth=_ilist(a.sweep_depth), prefill_chunk=a.prefill_chunk, validate=a.validate)
