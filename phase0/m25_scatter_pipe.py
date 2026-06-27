@@ -63,7 +63,7 @@ def launch_stage(host, port, stage, nstages, lo, hi, is_tail):
     nxt = "" if is_tail else f"--next 127.0.0.1:{FWD_RING}"
     cmd = (f"nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -r kill -9 2>/dev/null; "
            f"fuser -k {ENG_IN}/tcp 2>/dev/null; sleep 4; rm -f /root/stage.log; cd /root && "
-           f"SHARD_TRANSPORT=libp2p CUDA_VISIBLE_DEVICES=0 M25_DIR=/root/m25 setsid bash -c "
+           f"SHARD_TRANSPORT=libp2p CUDA_VISIBLE_DEVICES=0 M25_DIR=/root/m25 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True setsid bash -c "
            f"'/root/venv/bin/python /root/m25_pipe.py stage --stage {stage} --nstages {nstages} --lo {lo} --hi {hi} "
            f"--port {ENG_IN} {nxt} > /root/stage.log 2>&1' </dev/null >/dev/null 2>&1 &")
     try:
@@ -92,6 +92,8 @@ def main():
     ap.add_argument("--max-new", type=int, default=256); ap.add_argument("--ngram-n", type=int, default=3)
     ap.add_argument("--prompt", default="Explain a decentralized inference swarm in 3 sentences.")
     ap.add_argument("--prompt-file", default=None)
+    ap.add_argument("--sweep", default=None); ap.add_argument("--sweep-depth", default=None)  # pass through to coord
+    ap.add_argument("--prefill-chunk", type=int, default=512)
     a = ap.parse_args()
     nodes = []
     for spec in a.order:
@@ -135,11 +137,12 @@ def main():
 
     head = nodes[0]
     pf = f"--prompt-file {a.prompt_file}" if a.prompt_file else f'--prompt "{a.prompt}"'
+    sw = (f"--sweep {a.sweep} " if a.sweep else "") + (f"--sweep-depth {a.sweep_depth} " if a.sweep_depth else "")
     print("[pipe] coordinator (pipelined) on head ...", flush=True)
     cmd = (f"cd /root && SHARD_TRANSPORT=libp2p CUDA_VISIBLE_DEVICES=0 M25_DIR=/root/m25 /root/venv/bin/python /root/m25_pipe.py coord "
            f"--head 127.0.0.1:{ENG_IN} --tail 127.0.0.1:{FWD_RET} --K {a.K} --depth {a.depth} --ngram-n {a.ngram_n} "
-           f"--max-new {a.max_new} {pf} 2>&1 | grep -vE 'INFO|WARNING|warn|instantiate'")
-    r = sh(head["host"], head["port"], cmd, timeout=1200)
+           f"--max-new {a.max_new} --prefill-chunk {a.prefill_chunk} {sw}{pf} 2>&1 | grep -vE 'INFO|WARNING|warn|instantiate'")
+    r = sh(head["host"], head["port"], cmd, timeout=1800 if (a.sweep or a.sweep_depth) else 1200)
     print(r.stdout, flush=True)
     if r.stderr.strip():
         print("[stderr]", r.stderr[-700:], flush=True)

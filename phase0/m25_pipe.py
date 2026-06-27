@@ -260,8 +260,37 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                 except OSError: pass
 
 
-def coord(head_ep, tail_ep, prompt, K, max_new, depth, ngram_n, timeout):
+def _sweep_summary(rows):
+    """Pure: format a K/depth sweep into an aligned table + the best-throughput row. No torch/model
+    deps so it unit-tests standalone (research/m25_sweep_test.py). `h_kb` is the per-traversal
+    inter-stage hidden-state payload (K+1)*H*fp16 — the bandwidth term that caps how far K pays off
+    once GPU compute is flat in token count, so it's printed next to tok/s to read the sweep."""
+    hdr = f"{'K':>3} {'depth':>5} {'tok/s':>7} {'g':>6} {'accept':>7} {'prefill':>8} {'ntok':>5} {'h/trav':>8}"
+    lines = ["", "=== M2.5 swarm sweep (decode tok/s, warm over libp2p) ===", hdr, "-" * len(hdr)]
+    for r in rows:
+        flag = "" if r.get("ok") else "  <-- FAIL"
+        lines.append(f"{r['K']:>3} {r['depth']:>5} {r['tok_s']:>7.2f} {r['g']:>6.2f} "
+                     f"{r['accept'] * 100:>6.0f}% {r['prefill_s']:>7.2f}s {r['ntok']:>5} {r['h_kb']:>6.1f}K{flag}")
+    ok = [r for r in rows if r.get("ok") and r["tok_s"] > 0]
+    best = max(ok, key=lambda r: r["tok_s"]) if ok else None
+    if best:
+        lines.append("-" * len(hdr))
+        lines.append(f"BEST: K={best['K']} depth={best['depth']} -> {best['tok_s']:.2f} tok/s "
+                     f"(g={best['g']:.2f}, accept={best['accept'] * 100:.0f}%)")
+    return "\n".join(lines), best
+
+
+def _run_job(pipe, ret, tok, messages, k, max_new, timeout, d, ngram_n, prefill_chunk):
+    """One coordinate_pipe job with a FRESH drafter (clean n-gram state per config). Sockets are
+    reused across sweep configs — coordinate_pipe drains in-flight + opens each job with `reset`,
+    which clears every stage's KV, so back-to-back jobs on the same ring are clean."""
     from ngram_draft import NgramDrafter
+    drafter = NgramDrafter(ng=ngram_n)
+    return coordinate_pipe(pipe, tok, messages, k, max_new, timeout, d, ret_sock=ret,
+                           local_draft=drafter, tools=None, prefill_chunk=prefill_chunk, max_ctx=131072)
+
+
+def coord(head_ep, tail_ep, prompt, K, max_new, depth, ngram_n, timeout, sweep=None, sweep_depth=None, prefill_chunk=512):
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(S.DIR, trust_remote_code=True)
     hh, hp = head_ep.rsplit(":", 1); th, tp = tail_ep.rsplit(":", 1)
@@ -269,11 +298,33 @@ def coord(head_ep, tail_ep, prompt, K, max_new, depth, ngram_n, timeout):
     ret = socket.create_connection((th, int(tp)), timeout=timeout); ret.setsockopt(*NODELAY); ret.settimeout(timeout)
     send_msg(ret, {"op": "hello_return"})                       # identify the return channel to the tail
     recv_msg(ret)                                               # wait ret_ok: tail confirmed ret before any reset flows
-    drafter = NgramDrafter(ng=ngram_n)
-    print(f"[coord] pipelined (K={K} depth={depth} ngram={ngram_n}) -> head {head_ep}, ret {tail_ep}", flush=True)
     messages = [{"role": "user", "content": prompt}]
-    r = coordinate_pipe(pipe, tok, messages, K, max_new, timeout, depth, ret_sock=ret,
-                        local_draft=drafter, tools=None, prefill_chunk=4096, max_ctx=131072)
+
+    if sweep or sweep_depth:                                    # K/depth throughput sweep -> tok/s table
+        Ks = sweep or [K]; Ds = sweep_depth or [depth]
+        print(f"[coord] SWEEP K={Ks} depth={Ds} ngram={ngram_n} -> head {head_ep}, ret {tail_ep}", flush=True)
+        rows = []
+        for d in Ds:
+            for k in Ks:
+                row = {"K": k, "depth": d, "tok_s": 0.0, "g": 0.0, "accept": 0.0,
+                       "prefill_s": 0.0, "ntok": 0, "h_kb": (k + 1) * S.H * 2 / 1024, "ok": False, "text": ""}
+                try:
+                    r = _run_job(pipe, ret, tok, messages, k, max_new, timeout, d, ngram_n, prefill_chunk)
+                    row.update(tok_s=r["tok_s"], g=r["toks_per_traversal"], accept=r["mean_accept"] / max(k, 1),
+                               prefill_s=r["prefill_s"], ntok=r["n_tokens"], ok=r.get("ok", False), text=r.get("text", ""))
+                except Exception as e:
+                    row["err"] = f"{type(e).__name__}: {e}"
+                rows.append(row)
+                print(f"[sweep] K={k:>2} depth={d}: {row['tok_s']:>6.2f} tok/s  g={row['g']:.2f}  "
+                      f"accept={row['accept'] * 100:.0f}%  ({'ok' if row['ok'] else row.get('err', 'FAIL')})", flush=True)
+        table, best = _sweep_summary(rows)
+        print(table, flush=True)
+        if best:
+            print("\n[sweep] best output:\n" + (parse_completion(best["text"])["content"] or best["text"])[:800], flush=True)
+        return
+
+    print(f"[coord] pipelined (K={K} depth={depth} ngram={ngram_n}) -> head {head_ep}, ret {tail_ep}", flush=True)
+    r = _run_job(pipe, ret, tok, messages, K, max_new, timeout, depth, ngram_n, prefill_chunk)
     if r.get("ok"):
         parsed = parse_completion(r["text"])
         print(f"\n[coord] {r['n_tokens']}tok  {r['tok_s']:.2f} tok/s  g={r['toks_per_traversal']:.2f}  "
@@ -304,9 +355,16 @@ if __name__ == "__main__":
     pc.add_argument("--prompt-file", default=None); pc.add_argument("--K", type=int, default=6)
     pc.add_argument("--depth", type=int, default=4); pc.add_argument("--max-new", type=int, default=256)
     pc.add_argument("--ngram-n", type=int, default=3); pc.add_argument("--timeout", type=int, default=600)
+    pc.add_argument("--sweep", default=None, help="comma K list, e.g. 4,6,8,12,16 (drafter margin is safe to K<=16)")
+    pc.add_argument("--sweep-depth", default=None, help="comma depth list, e.g. 2,4,8 (default: --depth)")
+    pc.add_argument("--prefill-chunk", type=int, default=512, help="prefill tokens per ring traversal; bounds the O(s^2) attn matrix so a long prompt doesn't OOM a memory-tight stage")
     a = ap.parse_args()
+
+    def _ilist(s): return [int(x) for x in s.split(",") if x.strip()] if s else None
+
     if a.role == "stage":
         serve(a.stage, a.nstages, a.lo, a.hi, a.port, a.next, a.timeout)
     else:
         prompt = open(a.prompt_file).read() if a.prompt_file else a.prompt
-        coord(a.head, a.tail, prompt, a.K, a.max_new, a.depth, a.ngram_n, a.timeout)
+        coord(a.head, a.tail, prompt, a.K, a.max_new, a.depth, a.ngram_n, a.timeout,
+              sweep=_ilist(a.sweep), sweep_depth=_ilist(a.sweep_depth), prefill_chunk=a.prefill_chunk)

@@ -171,14 +171,20 @@ class Layer:
 
 
 _PE = None
-def get_pe(maxpos=8192):
+# Rotary table length. MUST cover the full context: attn() indexes cos[start_pos:start_pos+s],
+# so a table shorter than the prompt+gen length silently returns a short/empty slice (garbage RoPE)
+# the moment a position exceeds it. The old hard-coded 8192 broke any >8k context (incl. the runbook's
+# >=30k long-ctx validation). Default 131072 matches the coordinator's max_ctx; bump via M25_MAX_POS.
+_MAXPOS = int(os.environ.get("M25_MAX_POS", "131072"))
+def get_pe(maxpos=None):
     global _PE
     if _PE is None:
+        mp = maxpos or _MAXPOS
         rot = M.MiniMaxM2RotaryEmbedding(cfg).to(dev)
         dummy = torch.zeros(1, 1, H, dtype=torch.bfloat16, device=dev)
-        pos = torch.arange(maxpos, device=dev).unsqueeze(0)
+        pos = torch.arange(mp, device=dev).unsqueeze(0)
         cos, sin = rot(dummy, pos)
-        _PE = (cos[0], sin[0])                                       # [maxpos, 64]
+        _PE = (cos[0], sin[0])                                       # [mp, 64]
     return _PE
 
 
