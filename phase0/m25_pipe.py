@@ -175,6 +175,77 @@ def _sdpa_backend_probe(stage):
               f"(materializes scores; long-ctx will OOM). Lower prefill_chunk or set M25_SDPA=0.", flush=True)
 
 
+def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, ret_sock, drafters,
+                          tools=None, prefill_chunk=4096, max_ctx=0):
+    """CONTINUOUS-BATCHING coordinator: B independent spec-decode streams share ONE ring traversal per
+    round, so the WAN round-trip is amortized across all B (aggregate-throughput lever). SYNCHRONOUS
+    (one batched verify per round — no per-stream depth pipelining; the batching itself provides the
+    win). Each stream's output is byte-identical to a solo coordinate_pipe run (per-stream KV row +
+    per-stream causal mask + per-stream MoE on the stage side guarantee it). Prefill is PER-STREAM
+    (variable length) into batch-row b; only the fixed-shape K+1 decode is batched. Greedy.
+
+    Protocol: reset_batch -> prefill each stream (op=verify, stream=b) -> per round, op=verify_batch
+    with token_ids_b/start_b for the ACTIVE streams; the ring returns B argmax rows."""
+    B = len(messages_list)
+    rx = ret_sock if ret_sock is not None else pipe_sock
+    pipe_sock.settimeout(timeout)
+    _eos = tok.eos_token_id
+    eos_set = set(_eos) if isinstance(_eos, (list, tuple)) else {_eos}
+    prompts = [render_ids(tok, m, tools=tools) for m in messages_list]
+    mx = [max(16, min(max_new, max_ctx - len(p) - 16)) if max_ctx else max_new for p in prompts]
+    out = [[] for _ in range(B)]; pos = [0] * B; cur = [0] * B; done = [False] * B
+    t_recv = 0.0; t0 = time.time()
+    send_msg(pipe_sock, {"op": "reset_batch", "B": B}); recv_msg(rx)
+    for b in range(B):                                   # PER-STREAM prefill into row b (variable length)
+        gen = prompts[b]
+        if prefill_chunk and len(gen) > prefill_chunk:
+            rr = None
+            for i in range(0, len(gen), prefill_chunk):
+                send_msg(pipe_sock, {"op": "verify", "stream": b, "token_ids": gen[i:i + prefill_chunk], "start": i, "prefill": True})
+                rr = recv_msg(rx)
+            cur[b] = rr[-1]
+        else:
+            send_msg(pipe_sock, {"op": "verify", "stream": b, "token_ids": gen, "start": 0, "prefill": True}); cur[b] = recv_msg(rx)[-1]
+        pos[b] = len(gen); out[b] = [cur[b]]
+        if cur[b] in eos_set or len(out[b]) >= mx[b]: done[b] = True
+        drafters[b].request(prompts[b] + [cur[b]], K)
+    rounds = 0
+    while not all(done):
+        rounds += 1
+        tids = []; dss = []
+        for b in range(B):                              # each ACTIVE stream drafts K; done streams send a pad row (ignored)
+            if done[b]:
+                tids.append([cur[b]] * (K + 1)); dss.append(None); continue
+            ds = drafters[b].fetch(); dss.append(ds); tids.append([cur[b]] + ds)
+        send_msg(pipe_sock, {"op": "verify_batch", "token_ids_b": tids, "start_b": list(pos)})
+        tr = time.time(); rb = recv_msg(rx); t_recv += time.time() - tr   # rb: [B][K+1] per-stream argmax
+        for b in range(B):
+            if done[b]:
+                continue
+            ds = dss[b]; r = rb[b]; n = 0
+            for j in range(K):
+                if ds[j] == r[j]: n += 1
+                else: break
+            if n == K:
+                out[b].extend(ds); pos[b] += K; cur[b] = ds[-1]; committed = ds
+            else:
+                committed = ds[:n] + [r[n]]; out[b].extend(committed); cur[b] = r[n]; pos[b] += n + 1
+            if len(out[b]) >= mx[b] or (cur[b] in eos_set) or (eos_set & set(committed)):
+                done[b] = True
+            else:
+                drafters[b].request(prompts[b] + out[b], K)
+    dt = time.time() - t0
+    res = []
+    for b in range(B):                                  # trim at first eos, per stream
+        o = out[b]
+        for ee in eos_set:
+            if ee in o: o = o[:o.index(ee)]; break
+        res.append({"ok": True, "output_ids": o, "n_tokens": len(o), "prompt_tokens": len(prompts[b]),
+                    "text": tok.decode(o, skip_special_tokens=True)})
+    return {"streams": res, "B": B, "rounds": rounds, "dt": dt,
+            "agg_tok_s": sum(len(r["output_ids"]) for r in res) / max(dt, 1e-9)}
+
+
 def _load(stage, nstages, lo, hi):
     S.vllm_ctx()
     layers = [S.Layer(i) for i in range(lo, hi)]
