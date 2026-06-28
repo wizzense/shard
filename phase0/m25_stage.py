@@ -290,6 +290,8 @@ class Layer:
             return torch.cat([tr * cu + _rotate_half(tr) * su, tp], -1)
         q, k = ap(q), ap(k)
         total = start + s
+        if total > M25_KV_MAXLEN:                      # clean error, not an out-of-bounds CUDA assert that kills the stage
+            raise RuntimeError(f"batched prefill context {total} exceeds M25_KV_MAXLEN {M25_KV_MAXLEN} (raise --kv-maxlen or shorten the prompt)")
         cp = torch.arange(start, total, device=dev)
         self.bkc[b:b + 1].index_copy_(2, cp, _kv_enc(k)); self.bvc[b:b + 1].index_copy_(2, cp, _kv_enc(v))   # b:b+1 view → row b (fp8 bytes if M25_KV_FP8)
         with sdpa_kernel(_SDPA_BACKENDS):
