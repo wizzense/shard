@@ -53,6 +53,12 @@ M25_KV_MAXLEN = int(os.environ.get("M25_KV_MAXLEN", "40960"))
 # pattern, proven bit-exact), the MoE runs PER STREAM (NVFP4 MoE is token-count non-invariant), prefill
 # writes one row. Each stream's output is byte-identical to solo. Default 1 (single-stream path untouched).
 M25_BATCH = int(os.environ.get("M25_BATCH", "1"))
+# Opt-in fp8 KV (M25_KV_FP8=1): store the batched KV cache as float8_e4m3 (HALF the bf16 footprint -> 2x the
+# context/streams that fit) and dequant to bf16 just before SDPA/matmul (no fp8-attention kernel needed — we
+# own the read). fp8 is float (relative precision ~6%), and K/V are post-RMSNorm O(1) so no scale is needed;
+# the HD=128 dot-product averages the per-element error down ~/sqrt(128). Validate the needle before trusting.
+M25_KV_FP8 = os.environ.get("M25_KV_FP8", "0") != "0"
+_KVDT = torch.float8_e4m3fn if M25_KV_FP8 else torch.bfloat16
 
 
 def _bucket(need):                                  # smallest decode bucket >= need, clamped to MAXLEN
@@ -174,9 +180,9 @@ class Layer:
             self.kc = torch.zeros(1, NKV, M25_KV_MAXLEN, HD, dtype=torch.bfloat16, device=dev)
             self.vc = torch.zeros(1, NKV, M25_KV_MAXLEN, HD, dtype=torch.bfloat16, device=dev)
         self.bkc = self.bvc = None
-        if M25_BATCH > 1:                                          # [B,NKV,MAXLEN,HD] per-stream KV for continuous batching
-            self.bkc = torch.zeros(M25_BATCH, NKV, M25_KV_MAXLEN, HD, dtype=torch.bfloat16, device=dev)
-            self.bvc = torch.zeros(M25_BATCH, NKV, M25_KV_MAXLEN, HD, dtype=torch.bfloat16, device=dev)
+        if M25_BATCH > 1:                                          # [B,NKV,MAXLEN,HD] per-stream KV for continuous batching (fp8 if M25_KV_FP8)
+            self.bkc = torch.zeros(M25_BATCH, NKV, M25_KV_MAXLEN, HD, dtype=_KVDT, device=dev)
+            self.bvc = torch.zeros(M25_BATCH, NKV, M25_KV_MAXLEN, HD, dtype=_KVDT, device=dev)
 
     def reset(self):
         if M25_STATIC_KV:
@@ -278,10 +284,10 @@ class Layer:
         q, k = ap(q), ap(k)
         total = start + s
         cp = torch.arange(start, total, device=dev)
-        self.bkc[b:b + 1].index_copy_(2, cp, k); self.bvc[b:b + 1].index_copy_(2, cp, v)   # b:b+1 is a view → writes row b
+        self.bkc[b:b + 1].index_copy_(2, cp, k.to(_KVDT)); self.bvc[b:b + 1].index_copy_(2, cp, v.to(_KVDT))   # b:b+1 view → row b (fp8 store if M25_KV_FP8)
         with sdpa_kernel(_SDPA_BACKENDS):
             o = torch.nn.functional.scaled_dot_product_attention(
-                q, self.bkc[b:b + 1, :, :total], self.bvc[b:b + 1, :, :total],
+                q, self.bkc[b:b + 1, :, :total].to(torch.bfloat16), self.bvc[b:b + 1, :, :total].to(torch.bfloat16),
                 attn_mask=causal_lower_right(s, total), scale=SCALING, enable_gqa=True)
         return lin(o.transpose(1, 2).reshape(1, s, NH * HD), self.o_proj)
 
@@ -302,9 +308,9 @@ class Layer:
             return torch.cat([tr * cu + _rotate_half(tr) * su, tp], -1)
         q, k = ap(q), ap(k)
         idx = cp.view(B, 1, s, 1).expand(B, NKV, s, HD)
-        self.bkc[:B].scatter_(2, idx, k); self.bvc[:B].scatter_(2, idx, v)        # per-stream scatter into rows [0,B)
+        self.bkc[:B].scatter_(2, idx, k.to(_KVDT)); self.bvc[:B].scatter_(2, idx, v.to(_KVDT))   # per-stream scatter into rows [0,B) (fp8 store if M25_KV_FP8)
         alen = _bucket(int(starts.max().item()) + s)
-        kk = self.bkc[:B, :, :alen].repeat_interleave(GRP, 1); vv = self.bvc[:B, :, :alen].repeat_interleave(GRP, 1)
+        kk = self.bkc[:B, :, :alen].to(torch.bfloat16).repeat_interleave(GRP, 1); vv = self.bvc[:B, :, :alen].to(torch.bfloat16).repeat_interleave(GRP, 1)   # dequant on read
         cols = torch.arange(alen, device=dev).view(1, 1, alen)
         amask = torch.where(cols <= cp[:, :, None], 0.0, float("-inf")).to(torch.bfloat16)[:, None]  # [B,1,s,alen]
         a = torch.matmul(q, kk.transpose(-1, -2)) * SCALING + amask
