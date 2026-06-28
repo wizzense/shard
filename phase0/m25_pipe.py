@@ -65,7 +65,7 @@ def _verify_receipts(receipts):
 
 def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_sock, local_draft,
                     tools=None, prefill_chunk=4096, max_ctx=0, prefill_depth=8, on_commit=None,
-                    swarm_id="swarm", job_id="job"):
+                    swarm_id="swarm", job_id="job", resume_ids=None, resumable=False):
     """PIPELINED coordinator copied verbatim from specpipe.coordinate_pipe (n-gram local_draft path,
     greedy, direct-return) — keep `depth` verify chunks in flight so throughput approaches the ring's
     per-chunk THROUGHPUT, not its full latency (the GLM 2.9->16.6 lever). Self-contained: only sockets
@@ -77,9 +77,10 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
     _eos = tok.eos_token_id
     eos_set = set(_eos) if isinstance(_eos, (list, tuple)) else {_eos}
     prompt_ids = render_ids(tok, messages, tools=tools)     # chat-template + tools injection (m25_tools)
-    gen_ids = list(prompt_ids)
+    resume_ids = list(resume_ids or [])                     # FT resume: re-prefill prompt+committed onto a healed ring, continue (not restart)
+    gen_ids = list(prompt_ids) + resume_ids
     if max_ctx:
-        max_new = max(16, min(max_new, max_ctx - len(gen_ids) - 16))
+        max_new = max(len(resume_ids) + 16, min(max_new, max_ctx - len(gen_ids) - 16))
     out = []; t_draft = t_recv = 0.0; prefill_s = 0.0; receipts = []
     try:
         send_msg(pipe_sock, {"op": "reset", "temp": 0.0, "top_p": 1.0, "top_k": 0, "seed": 0,
@@ -97,7 +98,7 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
         else:
             send_msg(pipe_sock, {"op": "verify", "token_ids": gen_ids, "start": 0}); cur = recv_msg(rx)[-1]
         prefill_s = time.time() - t_pf
-        pos = len(gen_ids); out = [cur]
+        pos = len(gen_ids); out = resume_ids + [cur]        # preserve recovered tokens; cur = next after them
         if on_commit: on_commit(out, 0.0)               # stream: first token from prefill
         inflight = []; discard = 0; send_pos = pos; dprefix = gen_ids + [cur]
         valid = accepted = wasted = 0; t0 = time.time(); done = False
@@ -132,6 +133,11 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
         if RECEIPTS:                                        # PROVE: sweep the ring once for signed per-stage receipts
             send_msg(pipe_sock, {"op": "receipt", "receipts": []}); receipts = recv_msg(rx)
     except EDGE_ERRORS as e:
+        if resumable:                                       # a node died: hand committed tokens back so the control plane heals + resumes (not restart)
+            committed = out if out else list(resume_ids)
+            return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:120]}", "resumable": True,
+                    "output_ids": committed, "n_tokens": len(committed),
+                    "text": tok.decode(committed, skip_special_tokens=True)}
         raise TransportError(f"pipeline edge failed at token {len(out)} ({type(e).__name__}: {e})") from e
     dt = time.time() - t0
     for ee in eos_set:
@@ -140,7 +146,8 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
     return {"ok": True, "text": tok.decode(out, skip_special_tokens=True), "n_tokens": len(out), "rounds": valid,
             "mean_accept": accepted / max(valid, 1), "toks_per_traversal": (accepted + valid) / max(valid, 1),
             "tok_s": len(out) / max(dt, 1e-9), "wasted": wasted, "prefill_s": prefill_s, "output_ids": out,
-            "prompt_tokens": len(prompt_ids), "receipts": receipts, "receipts_ok": receipts_ok,
+            "prompt_tokens": len(prompt_ids), "resume_tokens": len(resume_ids),
+            "receipts": receipts, "receipts_ok": receipts_ok,
             "final_confidence": conf.confidence() if conf else None}
 
 
