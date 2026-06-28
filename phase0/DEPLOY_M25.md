@@ -75,6 +75,29 @@ Always create boxes with `--env '-p 29600:29600'` (inter-stage transport unreach
 - **Receipts**: `SHARD_RECEIPTS=1` on every stage + coord. Coord prints N signed receipts, all sigs
   VALID, coverage `[0:62]` no gap/overlap. (`x_shard.receipts_ok` in the gateway response.)
 
+## Deploy — serve the OpenAI /v1 gateway over the ring
+Once the ring is warm (stages WARM, sidecars up), serve it as an OpenAI-compatible endpoint in one command:
+
+    python m25_scatter_pipe.py --order <region:iid:lo:hi ...> --K 8 --depth 4 --serve [--receipts]
+
+`--serve` brings up the ring then starts `m25_gateway.py` on the head (127.0.0.1:18000, persistent, via
+setsid/nohup) instead of a one-shot coord job, and prints the tunnel command. Reach it:
+
+    ssh -i ~/.ssh/vast_c0mpute -p <head_ssh_port> -L 8000:127.0.0.1:18000 root@<head_host>
+    curl http://localhost:8000/v1/chat/completions -H 'content-type: application/json' \
+      -d '{"model":"minimax-m2.5","messages":[{"role":"user","content":"hi"}],"stream":true}'
+
+Endpoints: `/v1/chat/completions` (messages + tools + tool_choice + streaming) and `/v1/models`. Responses
+carry `x_shard` telemetry (tok_s, mean_accept, receipts_ok). This gateway is the **c0mpute integration seam**
+— c0mpute calls this `/v1` endpoint (tunnel or expose :18000). HTTP layer proven in MOCK
+(`M25_GATEWAY_MOCK=1`); the engine path is the same `coordinate_pipe` the `--validate` pass exercises warm.
+
+**Beta limits (state them honestly):** single-stream (one ring; concurrent callers queue on `RING_LOCK`);
+GREEDY decode (`temperature`/`top_p`/`top_k` accepted but NOT applied — the tail argmaxes; lossless sampling
+is a separate engine lever); on a node death the gateway retry RESTARTS the request (the `resume_ids`/
+`resumable` primitive exists in `coordinate_pipe` but the gateway doesn't drive heal+resume yet). Adequate
+for a niche/beta deploy — see `docs/DEPLOY_READINESS.md` for the full gap list.
+
 ## CUDA-graph lever (#6 — develop ON the box, it's empirical; NOT a free win)
 The per-traversal ~95ms GPU is launch-overhead-bound (19.7ms/stage, FLAT in token count) → a CUDA graph
 that cuts kernel-launch count is THE tok/s lever. But this is a real on-box engineering task with a

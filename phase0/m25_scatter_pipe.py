@@ -27,7 +27,8 @@ def sh(host, port, cmd, timeout=120):
 
 def push_code(host, port):
     for f in ["phase0/m25_pipe.py", "phase0/m25_stage.py", "phase0/m25_tools.py", "phase0/ngram_draft.py",
-              "phase0/node_kv.py", "phase0/confidence.py", "shard/transport.py", "shard/receipt.py", "shard/manifest.py"]:
+              "phase0/node_kv.py", "phase0/confidence.py", "phase0/m25_gateway.py",
+              "shard/transport.py", "shard/receipt.py", "shard/manifest.py"]:
         dst = "/root/" + f.split("/")[-1]
         subprocess.run(["scp", *SSHO, "-P", str(port), f"{REPO}/{f}", f"root@{host}:{dst}"], capture_output=True, text=True)
 
@@ -96,6 +97,7 @@ def main():
     ap.add_argument("--sweep", default=None); ap.add_argument("--sweep-depth", default=None)  # pass through to coord
     ap.add_argument("--prefill-chunk", type=int, default=512)
     ap.add_argument("--validate", action="store_true"); ap.add_argument("--receipts", action="store_true")
+    ap.add_argument("--serve", action="store_true", help="deploy mode: after warm, start the OpenAI /v1 gateway on the head (persistent) instead of a one-shot coord job")
     a = ap.parse_args()
     nodes = []
     for spec in a.order:
@@ -138,6 +140,20 @@ def main():
             return
 
     head = nodes[0]
+    if a.serve:                                   # DEPLOY: start the OpenAI /v1 gateway on the head over the warm ring
+        GW = 18000
+        rc = "SHARD_RECEIPTS=1 " if a.receipts else ""
+        gw = (f"fuser -k {GW}/tcp 2>/dev/null; sleep 1; cd /root && {rc}SHARD_TRANSPORT=libp2p M25_DIR=/root/m25 "
+              f"setsid nohup /root/venv/bin/python /root/m25_gateway.py --head 127.0.0.1:{ENG_IN} --tail 127.0.0.1:{FWD_RET} "
+              f"--port {GW} --K {a.K} --depth {a.depth} --ngram-n {a.ngram_n} > /root/gateway.log 2>&1 </dev/null & echo SERVING")
+        sh(head["host"], head["port"], gw, 30); time.sleep(4)
+        up = sh(head["host"], head["port"], "grep -c 'm25-gateway' /root/gateway.log 2>/dev/null || echo 0", 20)
+        ok = (up.stdout.strip().splitlines() or ["0"])[-1].strip() not in ("", "0")
+        print(f"[pipe] gateway {'UP' if ok else 'starting (check /root/gateway.log)'} on head, 127.0.0.1:{GW} (OpenAI /v1, single-stream)", flush=True)
+        print(f"[pipe] reach it:  ssh -i {KEY} -p {head['port']} -L 8000:127.0.0.1:{GW} root@{head['host']}   then POST http://localhost:8000/v1/chat/completions", flush=True)
+        if not ok:
+            print(sh(head["host"], head["port"], "tail -5 /root/gateway.log", 20).stdout, flush=True)
+        return
     pf = f"--prompt-file {a.prompt_file}" if a.prompt_file else f'--prompt "{a.prompt}"'
     sw = (f"--sweep {a.sweep} " if a.sweep else "") + (f"--sweep-depth {a.sweep_depth} " if a.sweep_depth else "") + ("--validate " if a.validate else "")
     rc = "SHARD_RECEIPTS=1 " if a.receipts else ""

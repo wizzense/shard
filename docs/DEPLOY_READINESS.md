@@ -11,11 +11,22 @@
 > | Signed per-stage receipts | ✅ PASS (coverage [0:62], all sigs valid) |
 > | Lossless spec sampling | ✅ (from gpt-oss work, transport-agnostic) |
 > | Warm throughput | 20.63 tok/s short-ctx (session 6); 6.36 tok/s long-ctx decode |
+> | **Serve as OpenAI /v1** | ✅ gateway wired — `m25_scatter_pipe.py --serve` brings up ring + gateway (HTTP proven MOCK; engine path == validated `coordinate_pipe`) |
 >
-> **Remaining M2.5 engine work (approved plan):** Phase 3 throughput (StaticKV + CUDA-graph — long-ctx
-> decode is WAN-bound at 6.36 tok/s), Phase 4 fault-tolerance port to m25_pipe, Phase 5 multi-request
-> concurrency. Network/PAY/challenge = c0mpute-side. Receipts: `docs/receipts/m25-usability-20260628.json`.
-> Runbook: `phase0/DEPLOY_M25.md`.
+> **DEPLOYABLE NOW** for the niche (long-ctx retrieval + tools, greedy, single-stream). Deploy: ring up +
+> `--serve` → OpenAI `/v1` on the head (see `phase0/DEPLOY_M25.md` § Deploy). Beta limits: greedy only
+> (sampling accepted-not-applied), single-stream (RING_LOCK), node-death = request restart.
+>
+> **Hardening roadmap (NOT deploy blockers):**
+> - 3a StaticKV — ✅ done, HW bit-identical (opt-in `M25_STATIC_KV`).
+> - 4 fault tolerance — resume primitive ✅ done+proven (`resume_ids`/`resumable` in `coordinate_pipe`);
+>   gateway heal+resume wiring + the m25 healer orchestration remain (orchestration = c0mpute-side).
+> - 5 concurrency — NVFP4 MoE is token-count NON-invariant (measured) → per-stream MoE or a request queue,
+>   NOT batched MoE (would break receipt bit-exactness).
+> - 3b CUDA-graph — feasibility proven (3.4x bit-exact), but the production additive-mask path falls off
+>   flash (0.74x) → **EXPERIMENTAL/default-OFF**; needs a flex-attention rework. Mostly helps short-ctx
+>   (long-ctx decode is WAN-bound).
+> Network/PAY/challenge = c0mpute-side. Receipts: `docs/receipts/m25-{usability,graph-moe-static,cudagraph-production}-20260628.json`.
 
 ---
 
