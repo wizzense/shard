@@ -318,19 +318,28 @@ class Layer:
         q, k = ap(q), ap(k)
         idx = cp.view(B, 1, s, 1).expand(B, NKV, s, HD)
         self.bkc[:B].scatter_(2, idx, _kv_enc(k)); self.bvc[:B].scatter_(2, idx, _kv_enc(v))   # write all rows (fp8 bytes if M25_KV_FP8)
-        # PER-STREAM flash SDPA over each stream's OWN :total (causal_lower_right) — NOT one batched call with a
-        # dense per-stream mask. A dense mask forces SDPA->MATH, which materializes [B,NH,s,alen] scores (~1.5GB
-        # @32k) and OOMs the embed-heavy head. Per-stream causal SDPA is flash (O(total)) + reads only the written
-        # :total (not the padded bucket) -> big-ctx batched fits. Same pattern as attn_prefill_b; MoE already loops.
-        outs = []
-        for b in range(B):
-            total = int(starts[b].item()) + s
-            kb = _kv_view(self.bkc)[b:b + 1, :, :total].to(torch.bfloat16)
-            vb = _kv_view(self.bvc)[b:b + 1, :, :total].to(torch.bfloat16)
-            with sdpa_kernel(_SDPA_BACKENDS):
-                outs.append(torch.nn.functional.scaled_dot_product_attention(
-                    q[b:b + 1], kb, vb, attn_mask=causal_lower_right(s, total), scale=SCALING, enable_gqa=True))
-        return lin(torch.cat(outs, 0).transpose(1, 2).reshape(B, s, NH * HD), self.o_proj)
+        alen = _bucket(int(starts.max().item()) + s)
+        # HYBRID: small/medium context -> ONE batched manual matmul (fast, ~3x batched throughput); big context ->
+        # per-stream flash SDPA (the GQA-repeat [B,48,alen,HD] would OOM at big alen, and a batched dense mask
+        # forces SDPA->MATH which also OOMs). Threshold on the GQA-repeat size (kk+vv bf16 bytes).
+        if B * NH * alen * HD * 4 <= 1_400_000_000:                                # batched manual matmul path
+            kk = _kv_view(self.bkc)[:B, :, :alen].to(torch.bfloat16).repeat_interleave(GRP, 1)
+            vv = _kv_view(self.bvc)[:B, :, :alen].to(torch.bfloat16).repeat_interleave(GRP, 1)
+            cols = torch.arange(alen, device=dev).view(1, 1, alen)
+            amask = torch.where(cols <= cp[:, :, None], 0.0, float("-inf")).to(torch.bfloat16)[:, None]
+            a = torch.matmul(q, kk.transpose(-1, -2)) * SCALING + amask
+            o = torch.matmul(torch.softmax(a.float(), -1).to(vv.dtype), vv)
+        else:                                                                      # big-ctx: per-stream flash SDPA (memory-safe)
+            outs = []
+            for b in range(B):
+                total = int(starts[b].item()) + s
+                with sdpa_kernel(_SDPA_BACKENDS):
+                    outs.append(torch.nn.functional.scaled_dot_product_attention(
+                        q[b:b + 1], _kv_view(self.bkc)[b:b + 1, :, :total].to(torch.bfloat16),
+                        _kv_view(self.bvc)[b:b + 1, :, :total].to(torch.bfloat16),
+                        attn_mask=causal_lower_right(s, total), scale=SCALING, enable_gqa=True))
+            o = torch.cat(outs, 0)
+        return lin(o.transpose(1, 2).reshape(B, s, NH * HD), self.o_proj)
 
     def mlp_b(self, x):                                                            # per-stream MoE (token-count invariance)
         return torch.cat([self.mlp(x[b:b + 1]) for b in range(x.shape[0])], 0)

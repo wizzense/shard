@@ -359,7 +359,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                         if msg["op"] == "verify_batch":     # batched decode: [B,K+1,H] -> per-stream argmax [B][K+1]
                             h = S.run_block_decode_b(layers, torch.tensor(msg["start_b"], device=dev), msg["h"].to(dev), vcfg)
                             send_msg(ret, _tail_logits(h, parts).argmax(-1).tolist()); continue
-                        if msg.get("prefill"):              # prefill one stream into its row b -> per-pos argmax [L]
+                        if msg.get("prefill") and "stream" in msg:  # BATCHED prefill into row b (single-stream prefill has no 'stream' -> falls through to the normal path)
                             h = S.run_block_prefill_b(layers, msg["stream"], msg["start"], msg["h"].to(dev), vcfg)
                             send_msg(ret, _tail_logits(h, parts).argmax(-1)[0].tolist()); continue
                         x = msg["h"].to(dev)
@@ -407,7 +407,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             h = msg["h"].to(dev)
                         h = S.run_block_decode_b(layers, torch.tensor(msg["start_b"], device=dev), h, vcfg)
                         send_msg(nxt_sock, {"op": "verify_batch", "h": h.cpu(), "start_b": msg["start_b"]}); continue
-                    if msg.get("prefill"):                      # prefill one stream into its row b (head embeds)
+                    if msg.get("prefill") and "stream" in msg:  # BATCHED prefill into row b (single-stream prefill has no 'stream' -> normal path)
                         if parts["head"]:
                             h = torch.nn.functional.embedding(torch.tensor([msg["token_ids"]], device=dev), parts["embed_w"])
                         else:
