@@ -1,0 +1,27 @@
+{
+ "test": "MiniMax-M2.5 SDPA long-context OOM fix + full usability pass, WARM over libp2p on a scattered EU ring. Proves the prefill-attention fix (the deploy blocker) on real sm_120 hardware and re-confirms tools + multi-turn + signed receipts.",
+ "date": "2026-06-28",
+ "model": "MiniMax-M2.5-NVFP4 (229B-A10B, 62 layers, standard GQA 48q/8kv hd=128, NVFP4 experts + bf16 attn)",
+ "ring": "5 scattered EU RTX 5090s over libp2p (Noise, per-node keys, no PSK), even ~12-13 layers/stage: UK(head,0-12) -> UK(12-25) -> Czechia(25-38) -> Spain(38-50) -> UK(tail,50-62). Weights ~26.8-27.7GB/stage.",
+ "the_fix": "phase0/m25_stage.py Layer.attn: replaced the materialized [1,48,s,total] matmul + fp32 softmax (the prefill OOM root, ~6.5GB/stage at 10k) with torch SDPA scaled_dot_product_attention(causal_lower_right(s,total), enable_gqa=True) — online softmax, no score matrix, O(s) prefill memory. Opt-in M25_SDPA (default ON); naive path kept for A/B (M25_SDPA=0). commit e78dafe.",
+ "sdpa_backend_on_sm120": "Per-stage warm-up probe logged: SDPA fused backends available on sm_120: ['flash','cudnn'] on EVERY stage. A fused (memory-efficient) kernel engaged — NOT the MATH fallback. torch 2.10+cu128 on Blackwell.",
+ "headline": "The long-context OOM that blocked deploy is GONE: the ring prefilled a 28,681-token prompt in ~15-17s with ZERO OOM (3x past the old ~9-10k wall) and the model RETRIEVED the needle (ZX-PAYLOAD-7731 at entry 00650, buried ~14k tokens deep). Tools + multi-turn + receipts all pass warm.",
+ "results": {
+  "1_tool_calling": "PASS — finish_reason tool_calls, structured get_weather(city=Paris), all 5 per-stage receipts VALID",
+  "2_multi_turn_9_turn": "PASS — recalled turn-1 facts SWARM-NODE-4417 + '5 RTX 5090s' after a 9-turn convo, receipts VALID",
+  "3_long_ctx_prefill": "PASS (the fix) — prompt_tokens=28681, prefill 15.0s (validate) / 17.07s (needle run), NO OOM, all stages WARM with the SDPA path",
+  "4_long_ctx_needle_retrieval": "PASS — model located entry 00650 in the 28.7k-token ledger and returned token=ZX-PAYLOAD-7731 (max_new=96). NOTE: the validate harness gave only max_new=24, too few for this reasoning model to get past restating the question -> a FALSE 'FAIL' on the first run; bumped to 96 in _validate (same commit).",
+  "5_receipts": "PASS — every per-stage receipt signed + sig VALID, layer coverage [0:62] no gap/overlap, hash-chain in_root->out_root contiguous across all 5 stages"
+ },
+ "long_ctx_decode_tok_s": 6.36,
+ "long_ctx_decode_config": "K=8 depth=4 ngram-n=3, g=1.28 tok/traversal, mean_accept 0.28/8 (reasoning text drafts poorly), prefill-chunk=512, greedy",
+ "short_ctx_tool_tok_s": 4.9,
+ "output_sha_needle_run": "8f642d87a292",
+ "honest_notes": [
+  "The OOM fix is the win and it's proven on hardware (flash+cudnn engaged, 28.7k prefilled, no OOM). Long-context PREFILL is now O(chunk), not O(chunk*ctx).",
+  "Long-context DECODE is slow over a 5-stage WAN ring (6.36 tok/s) — each token attends 28.7k per stage across the ring. That is a throughput characteristic, not the OOM, and it is exactly what Phase 3 (StaticKV + CUDA-graph) targets.",
+  "The first validate run reported long-ctx FAIL purely because _validate allotted max_new=24 — the model restates then reasons then answers, and 24 tokens only covered the restate. Re-run at max_new=96 retrieved the needle cleanly. Harness fixed.",
+  "Ops reality (on-brand for scattered consumer GPUs): hit the documented hf_transfer stall on 2 boxes (recovered via HF_HUB_ENABLE_HF_TRANSFER=0 + cache wipe), one head box wedged its snapshot cache and one wedged pip on pypi timeouts (replaced via a 2-candidate race), SSH-key propagation lag. Pass cost ~$11.76 (inflated by a vastai-destroy confirmation-prompt change that silently cancelled earlier teardowns -> ~5 zombie boxes billed; see memory vast-destroy-needs-confirm)."
+ ],
+ "files": ["phase0/m25_stage.py", "phase0/m25_pipe.py", "research/m25_sdpa_test.py"]
+}

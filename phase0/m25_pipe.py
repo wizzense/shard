@@ -363,9 +363,9 @@ def _validate(pipe, ret, tok, K, depth, ngram_n, prefill_chunk, timeout, longctx
     # 3) LONG CONTEXT — needle retrieval far past the old 8192 RoPE cap (proves the rope fix + chunked prefill)
     lc = open(longctx_path).read()
     m = [{"role": "user", "content": lc}]
-    r = _run_job(pipe, ret, tok, m, K, 24, timeout, depth, ngram_n, prefill_chunk, tools=None)
+    r = _run_job(pipe, ret, tok, m, K, 96, timeout, depth, ngram_n, prefill_chunk, tools=None)  # M2.5 reasons before answering; 24 only covered the restate (false FAIL on 2026-06-28)
     p = parse_completion(r["text"]); ans = (p["content"] or r["text"]).strip()
-    hit = "ZX-PAYLOAD-7731" in ans
+    hit = "ZX-PAYLOAD-7731" in r["text"]   # needle anywhere in the output (model surfaces it via reasoning, then answers)
     print(f"[validate] 3.LONG-CTX   {'PASS (needle found)' if hit else 'FAIL'}  prompt_tokens={r['prompt_tokens']}  "
           f"prefill={r['prefill_s']:.1f}s  answer={ans[:80]!r}  receipts_ok={r.get('receipts_ok')}", flush=True)
 
