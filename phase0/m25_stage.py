@@ -47,6 +47,17 @@ _SDPA_BACKENDS = [SDPBackend.FLASH_ATTENTION, SDPBackend.CUDNN_ATTENTION,
 # with causal_lower_right, so the static path is BIT-IDENTICAL to cat (proven: research/m25_statickv_test.py).
 M25_STATIC_KV = os.environ.get("M25_STATIC_KV", "0") != "0"
 M25_KV_MAXLEN = int(os.environ.get("M25_KV_MAXLEN", "40960"))
+# CUDA-graph decode (opt-in M25_CUDA_GRAPH): capture run_block at a FIXED (s=K+1, bucket) shape so a verify
+# block replays as ONE graph — removes per-kernel launch overhead (proven 3.40x/block, bit-exact, sm_120).
+# Needs M25_STATIC_KV (fixed addresses) + M25_SDPA. The varying start_pos is carried into the captured graph
+# by _GR's STATIC buffers: the RoPE slice (cos/sin), the index_copy_ write positions (cp), and a bucketed
+# ADDITIVE causal mask (causal_lower_right mis-aligns under a bucketed read). Prefill stays eager; default
+# OFF (eager byte-identical). M25_STATIC_KV is force-enabled when this is on.
+M25_CUDA_GRAPH = os.environ.get("M25_CUDA_GRAPH", "0") != "0"
+if M25_CUDA_GRAPH:
+    M25_STATIC_KV = True
+DECODE_BUCKETS = (2048, 4096, 8192, 16384, 32768, 65536, 131072)
+_GR = None        # active _GraphState during capture (None = eager); attn reads its static buffers
 NORM_TOPK = getattr(cfg, "norm_topk_prob", True)
 ROUTED_SCALE = getattr(cfg, "routed_scaling_factor", 1.0)
 
@@ -156,19 +167,30 @@ class Layer:
         k = self._rms(lin(x, self.k_proj), self.k_norm).view(b, s, NKV, HD).transpose(1, 2)
         v = lin(x, self.v_proj).view(b, s, NKV, HD).transpose(1, 2)
         rd = cos.shape[-1]
-        cu = cos[start_pos:start_pos + s].unsqueeze(0).unsqueeze(0)   # [1,1,s,rd]
-        su = sin[start_pos:start_pos + s].unsqueeze(0).unsqueeze(0)
+        gr = _GR                                                   # CUDA-graph state during capture (None = eager)
+        if gr is not None:                                         # graph: RoPE slice comes from a static buffer (start_pos varies, can't bake a Python slice)
+            cu = gr.cos.unsqueeze(0).unsqueeze(0); su = gr.sin.unsqueeze(0).unsqueeze(0)
+        else:
+            cu = cos[start_pos:start_pos + s].unsqueeze(0).unsqueeze(0)   # [1,1,s,rd]
+            su = sin[start_pos:start_pos + s].unsqueeze(0).unsqueeze(0)
         def ap(t):
             tr, tp = t[..., :rd], t[..., rd:]
             return torch.cat([tr * cu + _rotate_half(tr) * su, tp], -1)
         q, k = ap(q), ap(k)
-        if M25_STATIC_KV:                                          # fixed-address write at start_pos; rollback = overwrite + read :total
-            total = start_pos + s
+        total = start_pos + s
+        # amask: the bottom-right causal mask. Eager uses causal_lower_right (a CausalBias flag the kernel
+        # reads with no dense tensor — O(s) memory; is_causal is top-left and WRONG). The graphed path can't
+        # use it (the bucketed read kc[:,:,:alen] has an unwritten tail at [total:alen] that causal_lower_right
+        # mis-aligns to alen-1) — so it uses a static ADDITIVE mask (small for s=K+1, computed before replay).
+        if gr is not None:                                         # graphed verify block: static cp write, bucketed read, static additive mask
+            self.kc.index_copy_(2, gr.cp, k); self.vc.index_copy_(2, gr.cp, v)
+            kcur, vcur, amask = self.kc[:, :, :gr.alen, :], self.vc[:, :, :gr.alen, :], gr.mask
+        elif M25_STATIC_KV:                                        # fixed-address write at start_pos; rollback = overwrite + read :total
             if total > M25_KV_MAXLEN:
                 raise RuntimeError(f"context {total} exceeds M25_KV_MAXLEN {M25_KV_MAXLEN} (raise it or unset M25_STATIC_KV)")
             cp = torch.arange(start_pos, total, device=dev)
             self.kc.index_copy_(2, cp, k); self.vc.index_copy_(2, cp, v)
-            kcur, vcur = self.kc[:, :, :total, :], self.vc[:, :, :total, :]
+            kcur, vcur, amask = self.kc[:, :, :total, :], self.vc[:, :, :total, :], causal_lower_right(s, total)
         else:
             if self.kc is not None and self.kc.shape[2] > start_pos:
                 self.kc = self.kc[:, :, :start_pos, :].contiguous(); self.vc = self.vc[:, :, :start_pos, :].contiguous()
@@ -177,17 +199,12 @@ class Layer:
             else:
                 self.kc = torch.cat([self.kc, k], 2); self.vc = torch.cat([self.vc, v], 2)
             total = self.kc.shape[2]
-            kcur, vcur = self.kc, self.vc
+            kcur, vcur, amask = self.kc, self.vc, causal_lower_right(s, total)
         if M25_SDPA:
-            # The chunk is the LAST s positions (q at [start_pos, start_pos+s), k at [0, total)). That's a
-            # BOTTOM-RIGHT causal mask — `is_causal=True` is top-left aligned and WRONG here. causal_lower_right
-            # is read by the kernel as a flag (no dense [s,total] tensor), so memory stays O(s). enable_gqa
-            # lets the kernel read the 8-head cache directly (no 6x repeat_interleave expand).
             with sdpa_kernel(_SDPA_BACKENDS):
                 o = torch.nn.functional.scaled_dot_product_attention(
-                    q, kcur, vcur, attn_mask=causal_lower_right(s, total),
-                    scale=SCALING, enable_gqa=True)
-        else:                                                          # naive reference path (M25_SDPA=0, A/B)
+                    q, kcur, vcur, attn_mask=amask, scale=SCALING, enable_gqa=True)
+        else:                                                          # naive reference path (M25_SDPA=0, A/B; never graphed)
             kk = kcur.repeat_interleave(GRP, dim=1); vv = vcur.repeat_interleave(GRP, dim=1)
             attn = torch.matmul(q, kk.transpose(-1, -2)) * SCALING
             qpos = torch.arange(s, device=dev).view(s, 1) + start_pos
@@ -235,6 +252,83 @@ def run_block(layers, start_pos, h, vcfg):
         for L in layers:
             h = L.forward(h, start_pos, pe)
     return h
+
+
+class _GraphState:
+    """Static per-block buffers that carry the varying start_pos INTO a captured graph: the RoPE slice
+    (cos/sin), the index_copy_ write positions (cp), and the bucketed additive causal mask. set() updates
+    them IN PLACE (the same addresses the graph captured), so a replay attends the correct span at the new
+    start_pos. mask is [1,1,s,alen] additive bf16 — tiny for s=K+1, so materializing it is free."""
+    def __init__(self, s, alen, rd, dv):
+        self.s, self.alen = s, alen
+        self.cos = torch.zeros(s, rd, dtype=torch.bfloat16, device=dv)
+        self.sin = torch.zeros(s, rd, dtype=torch.bfloat16, device=dv)
+        self.cp = torch.zeros(s, dtype=torch.long, device=dv)
+        self.mask = torch.zeros(1, 1, s, alen, dtype=torch.bfloat16, device=dv)
+        self._kpos = torch.arange(alen, device=dv).view(1, alen)
+        self._ar = torch.arange(s, device=dv)
+
+    def set(self, start_pos, full_cos, full_sin):
+        self.cos.copy_(full_cos[start_pos:start_pos + self.s])
+        self.sin.copy_(full_sin[start_pos:start_pos + self.s])
+        self.cp.copy_(self._ar + start_pos)
+        qpos = (self._ar + start_pos).view(self.s, 1)                  # abs query positions
+        self.mask.copy_(torch.where(self._kpos <= qpos, 0.0, float("-inf")).to(torch.bfloat16)[None, None])
+
+
+class GraphRunner:
+    """Capture + replay a CUDA graph of a stage's run_block at a FIXED verify-block shape (s=K+1), one
+    graph per context bucket. Opt-in M25_CUDA_GRAPH; the serve loop routes fixed-shape verify blocks here
+    and leaves prefill eager. BIT-EQUIVALENCE to eager is a HARD correctness gate — the graphed stage is on
+    the spec-decode VERIFY path, so a capture bug corrupts committed output, not just a slow number."""
+    def __init__(self, layers, vcfg, s, dv=dev):
+        assert M25_STATIC_KV and M25_SDPA, "M25_CUDA_GRAPH requires M25_STATIC_KV + M25_SDPA"
+        self.layers, self.vcfg, self.s, self.dv = layers, vcfg, s, dv
+        self.cos, self.sin = get_pe(); self.rd = self.cos.shape[-1]
+        self.graphs = {}                                              # bucket alen -> (graph, h_static, state, out_static)
+
+    def _bucket(self, total):
+        for b in DECODE_BUCKETS:
+            if b >= total:
+                return min(b, M25_KV_MAXLEN)
+        return M25_KV_MAXLEN
+
+    def _layers(self, h):
+        for L in self.layers:
+            h = L.forward(h, 0, (self.cos, self.sin))                # start_pos unused in graph mode (attn reads _GR)
+        return h
+
+    def _capture(self, alen):
+        from vllm.forward_context import set_forward_context
+        global _GR
+        h = (torch.randn(1, self.s, H, device=self.dv) * 0.1).to(torch.bfloat16)   # static input buffer
+        st = _GraphState(self.s, alen, self.rd, self.dv)
+        st.set(alen - self.s, self.cos, self.sin)                    # capture-time start_pos (total == alen)
+        _GR = st
+        try:
+            side = torch.cuda.Stream(); side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side), torch.no_grad(), set_forward_context(None, self.vcfg):
+                for _ in range(3):
+                    self._layers(h)                                  # warm-up before capture
+            torch.cuda.current_stream().wait_stream(side); torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g), torch.no_grad(), set_forward_context(None, self.vcfg):
+                out = self._layers(h)
+        finally:
+            _GR = None                                               # capture done; attn back to eager for prefill
+        self.graphs[alen] = (g, h, st, out)
+
+    def run(self, start_pos, x):
+        """Run one verify/decode block at start_pos through the graph. Returns the STATIC output buffer —
+        the caller must consume/copy it before the next run (the serve loop sends .cpu()). Eager-identical."""
+        alen = self._bucket(start_pos + self.s)
+        if alen not in self.graphs:
+            self._capture(alen)
+        g, h, st, out = self.graphs[alen]
+        st.set(start_pos, self.cos, self.sin)                        # update varying-start_pos buffers IN PLACE
+        h.copy_(x)
+        g.replay(); torch.cuda.synchronize()
+        return out
 
 
 def _selftest(layer_ids):

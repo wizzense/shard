@@ -201,10 +201,25 @@ def _tail_logits(h, parts):
     return (x.to(torch.bfloat16) @ parts["lm_head_w"].t())   # [1, s, vocab]
 
 
+def _block(grs, layers, start, x, vcfg):
+    """Run one block. Route fixed-shape verify/decode blocks (small s = K+1) through a lazily-captured
+    CUDA graph when M25_CUDA_GRAPH (the proven 3.4x lever); prefill (large s) stays eager. grs caches one
+    GraphRunner per block size. The graphed path is bit-equivalent to run_block (proven), so receipts +
+    spec-decode losslessness are preserved."""
+    if S.M25_CUDA_GRAPH and x.shape[1] <= 64:
+        s = x.shape[1]
+        gr = grs.get(s)
+        if gr is None:
+            grs[s] = gr = S.GraphRunner(layers, vcfg, s)
+        return gr.run(start, x)
+    return S.run_block(layers, start, x, vcfg)
+
+
 def serve(stage, nstages, lo, hi, port, nxt, timeout):
     parts = _load(stage, nstages, lo, hi)
     layers = parts["layers"]
     vcfg = S._CTX[1]
+    graph_runners = {}                                # opt-in CUDA-graph cache (M25_CUDA_GRAPH); persists across jobs
     nxt_sock = None
     if not parts["tail"]:
         host, p = nxt.rsplit(":", 1)
@@ -251,7 +266,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                                 msg.setdefault("receipts", []).append({"stage": "tail", **signer.finalize()})
                             send_msg(ret, msg.get("receipts", [])); continue
                         x = msg["h"].to(dev)
-                        h = S.run_block(layers, msg["start"], x, vcfg)
+                        h = _block(graph_runners, layers, msg["start"], x, vcfg)
                         if RECEIPTS and signer is not None:   # attest this block's input->output transform
                             signer.observe(_act_digest(x), _act_digest(h))
                         toks = _tail_logits(h, parts).argmax(-1)[0].tolist()
@@ -290,7 +305,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                     else:
                         h = msg["h"].to(dev)
                     x = h
-                    h = S.run_block(layers, msg["start"], h, vcfg)
+                    h = _block(graph_runners, layers, msg["start"], h, vcfg)
                     if RECEIPTS and signer is not None:         # attest this block's input->output transform
                         signer.observe(_act_digest(x), _act_digest(h))
                     send_msg(nxt_sock, {"op": "verify", "h": h.cpu(), "start": msg["start"]})
