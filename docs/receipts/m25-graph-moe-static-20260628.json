@@ -1,0 +1,28 @@
+{
+ "test": "Single-box empirical probes (1 RTX 5090, layers 28-31) resolving the three gating questions for M2.5 Phase 3 (StaticKV+CUDA-graph) and Phase 5 (concurrency). Cheap decisive GPU dev — no ring needed.",
+ "date": "2026-06-28",
+ "model": "MiniMax-M2.5-NVFP4 (4 middle layers loaded)",
+ "box": "1x RTX 5090 (sm_120), torch 2.10+cu128, vLLM 0.23 NVFP4 cutlass FusedMoE",
+ "results": {
+  "phase3a_static_kv_hardware": {
+   "verdict": "BIT-IDENTICAL to cat on real hardware",
+   "evidence": "same prefill+verify+rollback sequence: cat hash c333820d665d7629 == static hash c333820d665d7629 (through SDPA-flash, deterministic per-GPU)",
+   "memory": "static pre-reserves +168 MB/layer at M25_KV_MAXLEN=40960 (+0.66 GB for 4 layers; ~2.2 GB for a full 13-layer stage) vs cat's grow-as-needed",
+   "implication": "M25_STATIC_KV is a safe drop-in; the fixed-MAXLEN memory cost is the tradeoff for fixed addresses"
+  },
+  "phase3b_cuda_graph_feasibility": {
+   "verdict": "FEASIBLE + BIT-EQUIVALENT + 3.40x — the gating risk (NVFP4 MoE graph-safety) is RESOLVED",
+   "capture": "CUDA-graph capture of run_block (static KV + NVFP4 cutlass MoE + SDPA, fixed K+1 shape) SUCCEEDED — the MoE and SDPA are graph-safe on sm_120",
+   "bit_equivalence": "graph-vs-eager max|diff| = 0.000e+00 (the mandatory verify-path gate passes)",
+   "speedup": "per-block eager 7.65ms -> graph 2.25ms = 3.40x on 4 layers (confirms per-stage GPU is launch-overhead-bound, the documented lever)",
+   "remaining": "production impl: graph the varying-start_pos decode/verify path via a static cp index buffer + a bucketed ADDITIVE mask (causal_lower_right mis-aligns under bucketed reads), opt-in M25_CUDA_GRAPH, per-bucket recapture. Feasibility + bit-exactness now proven."
+  },
+  "phase5_moe_invariance": {
+   "verdict": "NON-INVARIANT to token count — lossless BATCHED MoE is OFF the table (same class as the mxfp4 issue)",
+   "evidence": "token-0 MLP output: B=2 identical (diff 0), but B=4/8/16 diverge by a REPRODUCIBLE 1.953e-3 (rel 3.36e-3) — kernel grouping/padding, not FP noise",
+   "implication": "Phase 5 concurrency must use PER-STREAM MoE (attention still batches, ~1.24x on the old engine) or keep RING_LOCK + a request queue. A batched MoE would break spec-decode/receipt bit-exactness, so it's not acceptable for the 'provably honest' pitch."
+  }
+ },
+ "cost": "~$0.30 (one box ~20 min) vs ~$11.76 for the 5-box ring pass — single-box is the right tool for single-stage empirical questions",
+ "files": ["research/m25_onbox_graph.py", "research/m25_onbox_static.py", "research/m25_onbox_moe.py"]
+}
