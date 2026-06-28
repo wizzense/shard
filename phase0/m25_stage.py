@@ -48,11 +48,20 @@ _SDPA_BACKENDS = [SDPBackend.FLASH_ATTENTION, SDPBackend.CUDNN_ATTENTION,
 M25_STATIC_KV = os.environ.get("M25_STATIC_KV", "0") != "0"
 M25_KV_MAXLEN = int(os.environ.get("M25_KV_MAXLEN", "40960"))
 # CUDA-graph decode (opt-in M25_CUDA_GRAPH): capture run_block at a FIXED (s=K+1, bucket) shape so a verify
-# block replays as ONE graph — removes per-kernel launch overhead (proven 3.40x/block, bit-exact, sm_120).
-# Needs M25_STATIC_KV (fixed addresses) + M25_SDPA. The varying start_pos is carried into the captured graph
-# by _GR's STATIC buffers: the RoPE slice (cos/sin), the index_copy_ write positions (cp), and a bucketed
-# ADDITIVE causal mask (causal_lower_right mis-aligns under a bucketed read). Prefill stays eager; default
-# OFF (eager byte-identical). M25_STATIC_KV is force-enabled when this is on.
+# block replays as ONE graph — removes per-kernel launch overhead. Needs M25_STATIC_KV + M25_SDPA. Varying
+# start_pos is carried into the graph by _GR's STATIC buffers: RoPE slice (cos/sin), index_copy_ positions
+# (cp), and a bucketed additive causal mask. Prefill stays eager; default OFF.
+#
+# ⚠️ EXPERIMENTAL — DO NOT ENABLE FOR DEPLOY YET (on-box 2026-06-28, single 5090):
+#   * The GraphRunner capture/replay is CORRECT — it bit-exactly reproduces its eager computation (graph vs
+#     eager-additive diff = 0.0). The fixed-position probe with causal_lower_right hit 3.40x bit-exact.
+#   * BUT this path uses a dense ADDITIVE mask (causal_lower_right mis-aligns under a bucketed read), which
+#     FALLS OFF FLASH onto a slower backend → 0.74x (SLOWER), and its bf16 rounding differs from the eager
+#     causal_lower_right default, amplifying through MoE routing (graph vs eager-causal diff ~11). So toggling
+#     this changes output AND is slower — a dead end as-is.
+#   * FIX (next iteration): a FLASH-COMPATIBLE fixed-shape causal — FLEX-ATTENTION (create_block_mask, like
+#     gpt-oss fastverify) compiles the causal-bucket mask with no dense tensor and stays on the fast path.
+#     The GraphRunner scaffolding below is reusable; only attn's masked read needs swapping to flex.
 M25_CUDA_GRAPH = os.environ.get("M25_CUDA_GRAPH", "0") != "0"
 if M25_CUDA_GRAPH:
     M25_STATIC_KV = True

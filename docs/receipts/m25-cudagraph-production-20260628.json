@@ -1,0 +1,15 @@
+{
+ "test": "On-box validation of the M2.5 Phase 3b PRODUCTION CUDA-graph decode path (GraphRunner, varying start_pos). 1x RTX 5090, layers 28-31. The verify-path bit-equivalence gate caught that the additive-mask approach is a dead end BEFORE deploy.",
+ "date": "2026-06-28",
+ "status": "GraphRunner machinery CORRECT + proven faithful; the masking approach (additive mask) does NOT reach flash speed and diverges from the eager default — needs a flash-compatible rework (flex-attention). M25_CUDA_GRAPH left opt-in OFF + marked EXPERIMENTAL in code.",
+ "findings": {
+  "graph_capture_replay_is_faithful": "graph(run) vs eager-ADDITIVE (same op, no graph) max|diff| = 0.000e+00 — the capture/replay + the static start_pos/cp/mask buffers are correct; the GraphRunner reproduces its computation bit-exactly.",
+  "additive_mask_falls_off_flash": "the eager default uses causal_lower_right (a CausalBias flag -> FLASH). A bucketed read needs a dense ADDITIVE mask (causal_lower_right mis-aligns under bucketing), which routes SDPA to a slower backend: per-block eager-causal(flash) 3.12ms vs graph(additive) 4.20ms = 0.74x (SLOWER, not faster).",
+  "diverges_from_eager_default": "graph(additive) vs eager(causal_lower_right) final-hidden max|diff| ~11.5 — NOT a capture bug: a single layer differs only ~3.9e-3 (bf16 backend rounding: efficient/cudnn vs flash), but it amplifies through MoE expert-routing across the stack. The masked-SDPA primitive itself is fine (all variants ~1.2e-4 vs causal_lower_right).",
+  "fixed_position_probe_recap": "the earlier feasibility probe hit 3.40x BIT-EXACT because it used causal_lower_right (flash) at a fixed position — that proved graph-safety + the speedup ceiling; the production path must preserve flash."
+ },
+ "fix_direction": "FLEX-ATTENTION (torch create_block_mask, as gpt-oss fastverify used): compiles the causal-bucket mask with no dense tensor and stays on the fast path, so the graph keeps flash speed AND matches the eager numerics. The GraphRunner scaffolding (_GraphState static buffers, per-bucket capture, serve routing) is reusable — only attn's masked read swaps to flex. Alternative: a bottom-aligned sliding-window read (but it re-introduces a mask for total<alen).",
+ "what_landed": "GraphRunner + _GraphState + attn graph-mode branch + serve routing are committed (the scaffolding is correct and reusable); the bucketed additive mask is proven lossless OFFLINE (CPU MATH) but is the wrong GPU tool. M25_CUDA_GRAPH default OFF + EXPERIMENTAL note. Eager path (the deploy default) is untouched + byte-identical.",
+ "cost": "~$0.37 (one box ~25 min incl. debug)",
+ "files": ["phase0/m25_stage.py", "phase0/m25_pipe.py", "research/m25_onbox_graphrun.py", "research/m25_cudagraph_char.py"]
+}
