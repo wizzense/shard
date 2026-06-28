@@ -319,11 +319,14 @@ class Layer:
         idx = cp.view(B, 1, s, 1).expand(B, NKV, s, HD)
         self.bkc[:B].scatter_(2, idx, _kv_enc(k)); self.bvc[:B].scatter_(2, idx, _kv_enc(v))   # per-stream scatter into rows [0,B) (fp8 bytes if M25_KV_FP8)
         alen = _bucket(int(starts.max().item()) + s)
-        kk = _kv_view(self.bkc)[:B, :, :alen].to(torch.bfloat16).repeat_interleave(GRP, 1); vv = _kv_view(self.bvc)[:B, :, :alen].to(torch.bfloat16).repeat_interleave(GRP, 1)   # dequant on read
+        kcur = _kv_view(self.bkc)[:B, :, :alen].to(torch.bfloat16); vcur = _kv_view(self.bvc)[:B, :, :alen].to(torch.bfloat16)   # dequant on read
         cols = torch.arange(alen, device=dev).view(1, 1, alen)
-        amask = torch.where(cols <= cp[:, :, None], 0.0, float("-inf")).to(torch.bfloat16)[:, None]  # [B,1,s,alen]
-        a = torch.matmul(q, kk.transpose(-1, -2)) * SCALING + amask
-        o = torch.matmul(torch.softmax(a.float(), -1).to(vv.dtype), vv)
+        amask = torch.where(cols <= cp[:, :, None], 0.0, float("-inf")).to(torch.bfloat16)[:, None]  # [B,1,s,alen] per-stream causal
+        # SDPA w/ enable_gqa instead of manual matmul+repeat_interleave: the 6x GQA-repeat of the full bucket
+        # ([B,48,alen,HD] bf16) OOMs at big context (3.2GB @ 32768). SDPA keeps the 8 kv-heads (no repeat) and
+        # the s=K+1 decode makes the score tensor tiny -> enables much larger context/batch.
+        with sdpa_kernel(_SDPA_BACKENDS):
+            o = torch.nn.functional.scaled_dot_product_attention(q, kcur, vcur, attn_mask=amask, scale=SCALING, enable_gqa=True)
         return lin(o.transpose(1, 2).reshape(B, s, NH * HD), self.o_proj)
 
     def mlp_b(self, x):                                                            # per-stream MoE (token-count invariance)
