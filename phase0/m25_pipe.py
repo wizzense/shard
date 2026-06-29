@@ -63,6 +63,19 @@ def _verify_receipts(receipts):
     return ok
 
 
+def _unpack(resp):
+    """EAGLE verify return is {"toks":[ids], "aux":{li:[s,H]}}; the plain path returns just [ids]."""
+    if isinstance(resp, dict):
+        return resp.get("toks"), resp.get("aux")
+    return resp, None
+
+
+def _eagle_seed(aux, pos):
+    """Stack the 3 aux hidden states at chunk position `pos` -> [3,H] for EagleDrafter.set_hidden()."""
+    import torch as _t
+    return _t.stack([aux[str(li)][pos] for li in S.EAGLE_AUX_LAYER_IDS], 0)
+
+
 def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_sock, local_draft,
                     tools=None, prefill_chunk=4096, max_ctx=0, prefill_depth=8, on_commit=None,
                     swarm_id="swarm", job_id="job", resume_ids=None, resumable=False, reasoning=True):
@@ -94,9 +107,11 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
             for _ in range(len(starts)):
                 rr = recv_msg(rx)
                 if sent < len(starts): _send_pf(starts[sent]); sent += 1
-            cur = rr[-1]
+            toks, aux = _unpack(rr); cur = toks[-1]
         else:
-            send_msg(pipe_sock, {"op": "verify", "token_ids": gen_ids, "start": 0}); cur = recv_msg(rx)[-1]
+            send_msg(pipe_sock, {"op": "verify", "token_ids": gen_ids, "start": 0}); toks, aux = _unpack(recv_msg(rx)); cur = toks[-1]
+        if S.M25_EAGLE and aux is not None and hasattr(local_draft, "set_hidden"):
+            local_draft.set_hidden(_eagle_seed(aux, len(toks) - 1))   # seed EAGLE from the prompt's last position
         prefill_s = time.time() - t_pf
         pos = len(gen_ids); out = resume_ids + [cur]        # preserve recovered tokens; cur = next after them
         if on_commit: on_commit(out, 0.0)               # stream: first token from prefill
@@ -106,13 +121,14 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
                 if (ConfidenceScheduler and os.environ.get("M25_CONF_SCHED")) else None)  # K fixed (graph-safe); only in-flight depth adapts
         d_request(dprefix, K)
         while not done:
-            cur_depth = conf.value() if conf else depth                     # high accept -> full depth (throughput); low -> throttle to 1
+            cur_depth = 1 if S.M25_EAGLE else (conf.value() if conf else depth)   # EAGLE needs the verified hidden -> can't pipeline (v1: depth 1); else full depth
             while len(inflight) < cur_depth and not done:
                 td = time.time(); ds = d_fetch(); t_draft += time.time() - td
                 send_msg(pipe_sock, {"op": "verify", "token_ids": [dprefix[-1]] + ds, "start": send_pos})
                 inflight.append((send_pos, ds)); dprefix = dprefix + ds; send_pos += K
                 d_request(dprefix, K)
-            tr = time.time(); r = recv_msg(rx); t_recv += time.time() - tr
+            tr = time.time(); resp = recv_msg(rx); t_recv += time.time() - tr
+            r, aux = _unpack(resp)
             sp, ds = inflight.pop(0)
             if discard > 0: discard -= 1; wasted += 1; continue
             n = 0
@@ -126,6 +142,8 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
             else:
                 committed = ds[:n] + [r[n]]; out.extend(committed); cur = r[n]; pos += n + 1
                 discard = len(inflight); d_fetch(); dprefix = prompt_ids + out; send_pos = pos; d_request(dprefix, K)
+            if S.M25_EAGLE and aux is not None and hasattr(local_draft, "set_hidden"):
+                local_draft.set_hidden(_eagle_seed(aux, n))   # the target hidden that predicted the last committed token -> seed next EAGLE draft
             if on_commit: on_commit(out, time.time() - t0)   # stream: this commit's running output
             if len(out) >= max_new or (cur in eos_set) or (eos_set & set(committed)): done = True
         d_fetch()
@@ -304,6 +322,17 @@ def _block(grs, layers, start, x, vcfg):
     return S.run_block(layers, start, x, vcfg)
 
 
+def _merge_aux(upstream):
+    """EAGLE: accumulate this stage's captured aux hidden states (S._AUX, only the aux layers in [lo,hi))
+    onto whatever upstream stages already collected, so the tail returns all of [1,30,58] to the coordinator.
+    Keys are str(layer_id); values are [s,H] bf16 cpu tensors. No-op unless M25_EAGLE."""
+    acc = dict(upstream or {})
+    if S.M25_EAGLE:
+        for li, h in S._AUX.items():
+            acc[str(li)] = h.cpu()
+    return acc
+
+
 def serve(stage, nstages, lo, hi, port, nxt, timeout):
     parts = _load(stage, nstages, lo, hi)
     layers = parts["layers"]
@@ -368,7 +397,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                         if RECEIPTS and signer is not None:   # attest this block's input->output transform
                             signer.observe(_act_digest(x), _act_digest(h))
                         toks = _tail_logits(h, parts).argmax(-1)[0].tolist()
-                        send_msg(ret, toks)
+                        send_msg(ret, {"toks": toks, "aux": _merge_aux(msg.get("aux"))} if S.M25_EAGLE else toks)
                 except EDGE_ERRORS as e:
                     print(f"[tail] edge closed ({type(e).__name__}); reset", flush=True)
                     for L in layers:
@@ -423,7 +452,10 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                     h = _block(graph_runners, layers, msg["start"], h, vcfg)
                     if RECEIPTS and signer is not None:         # attest this block's input->output transform
                         signer.observe(_act_digest(x), _act_digest(h))
-                    send_msg(nxt_sock, {"op": "verify", "h": h.cpu(), "start": msg["start"]})
+                    fwd = {"op": "verify", "h": h.cpu(), "start": msg["start"]}
+                    if S.M25_EAGLE:                              # carry aux hidden states forward to the tail (EAGLE)
+                        fwd["aux"] = _merge_aux(msg.get("aux"))
+                    send_msg(nxt_sock, fwd)
             except EDGE_ERRORS as e:
                 print(f"[s{stage}] edge closed ({type(e).__name__}); reset", flush=True)
                 for L in layers:
