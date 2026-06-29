@@ -65,7 +65,7 @@ def _verify_receipts(receipts):
 
 def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_sock, local_draft,
                     tools=None, prefill_chunk=4096, max_ctx=0, prefill_depth=8, on_commit=None,
-                    swarm_id="swarm", job_id="job", resume_ids=None, resumable=False):
+                    swarm_id="swarm", job_id="job", resume_ids=None, resumable=False, reasoning=True):
     """PIPELINED coordinator copied verbatim from specpipe.coordinate_pipe (n-gram local_draft path,
     greedy, direct-return) — keep `depth` verify chunks in flight so throughput approaches the ring's
     per-chunk THROUGHPUT, not its full latency (the GLM 2.9->16.6 lever). Self-contained: only sockets
@@ -76,7 +76,7 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
     def d_fetch(): return local_draft.fetch()
     _eos = tok.eos_token_id
     eos_set = set(_eos) if isinstance(_eos, (list, tuple)) else {_eos}
-    prompt_ids = render_ids(tok, messages, tools=tools)     # chat-template + tools injection (m25_tools)
+    prompt_ids = render_ids(tok, messages, tools=tools, reasoning=reasoning)   # chat-template + tools; reasoning=False closes <think> -> direct answer (fast)
     resume_ids = list(resume_ids or [])                     # FT resume: re-prefill prompt+committed onto a healed ring, continue (not restart)
     gen_ids = list(prompt_ids) + resume_ids
     if max_ctx:
@@ -176,7 +176,7 @@ def _sdpa_backend_probe(stage):
 
 
 def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, ret_sock, drafters,
-                          depth=4, tools=None, prefill_chunk=4096, max_ctx=0):
+                          depth=4, tools=None, prefill_chunk=4096, max_ctx=0, reasoning=True):
     """CONTINUOUS-BATCHING coordinator: B independent spec-decode streams share ONE ring traversal per
     round, so the WAN round-trip is amortized across all B (aggregate-throughput lever). SYNCHRONOUS
     (one batched verify per round — no per-stream depth pipelining; the batching itself provides the
@@ -191,7 +191,7 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
     pipe_sock.settimeout(timeout)
     _eos = tok.eos_token_id
     eos_set = set(_eos) if isinstance(_eos, (list, tuple)) else {_eos}
-    prompts = [render_ids(tok, m, tools=tools) for m in messages_list]
+    prompts = [render_ids(tok, m, tools=tools, reasoning=reasoning) for m in messages_list]
     mx = [max(16, min(max_new, max_ctx - len(p) - 16)) if max_ctx else max_new for p in prompts]
     out = [[] for _ in range(B)]; pos = [0] * B; cur = [0] * B; done = [False] * B
     t_recv = 0.0; t_pf = time.time()

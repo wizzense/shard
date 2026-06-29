@@ -64,16 +64,32 @@ def _normalize_history(messages):
     return out
 
 
-def render_ids(tok, messages, tools=None, add_generation_prompt=True):
+_NOTHINK_IDS = {}                                 # tokenizer id() -> the "</think>\n\n" token ids (cached per tokenizer)
+
+
+def render_ids(tok, messages, tools=None, add_generation_prompt=True, reasoning=True):
     """Build prompt token ids from OpenAI-style messages [{role, content, ...}] and optional tools
     [{"type":"function","function":{...}}]. Returns a flat list[int] (no torch needed). The M2.5
-    template emits a BatchEncoding under return_dict=True, so we unwrap input_ids and flatten."""
+    template emits a BatchEncoding under return_dict=True, so we unwrap input_ids and flatten.
+
+    reasoning=False: the M2.5 chat template hardwires "<think>\n" at the generation prompt, so every
+    request normally reasons first (novel tokens -> 0% n-gram accept -> WAN-floor slow). For
+    latency-sensitive / high-overlap normal usage, append "</think>\n\n" to CLOSE the think block so
+    the model answers directly (the answer of a summarize/code/RAG task reuses the context -> the
+    n-gram drafter accepts it -> fast). This is the real-usage analogue of the benchmarks' think-skip,
+    now a first-class flag instead of a copy-task-only hack. Default True (reason, max quality)."""
     enc = tok.apply_chat_template(_normalize_history(messages), tools=tools or None,
                                   add_generation_prompt=add_generation_prompt, return_dict=True)
     ids = enc["input_ids"]
     if ids and isinstance(ids[0], (list, tuple)):  # [1, T] batch -> [T]
         ids = ids[0]
-    return list(ids)
+    ids = list(ids)
+    if add_generation_prompt and not reasoning:
+        key = id(tok)
+        if key not in _NOTHINK_IDS:
+            _NOTHINK_IDS[key] = list(tok("</think>\n\n", add_special_tokens=False)["input_ids"])
+        ids = ids + _NOTHINK_IDS[key]              # close the forced <think> -> direct answer (no reasoning)
+    return ids
 
 
 def _coerce(raw):

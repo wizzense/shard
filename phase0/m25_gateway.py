@@ -20,6 +20,11 @@ from m25_tools import parse_completion, to_openai_message, TOOLCALL_BEGIN, THINK
 
 MOCK = bool(os.environ.get("M25_GATEWAY_MOCK"))
 MODEL_ID = os.environ.get("M25_MODEL_ID", "minimax-m2.5")
+# default reasoning mode for the gateway: M2.5 hardwires a <think> block, which is novel (0% n-gram
+# accept) so it runs at the WAN floor and dominates latency. M25_DEFAULT_REASONING=0 makes the gateway
+# answer DIRECTLY by default (fast, for latency-sensitive/high-overlap normal usage); a request can
+# override per-call with {"reasoning": true/false} or {"reasoning_effort": "none"|...}. Default ON (quality).
+DEFAULT_REASONING = os.environ.get("M25_DEFAULT_REASONING", "1") != "0"
 NODELAY = (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 _ids = itertools.count(1)
 RING_LOCK = threading.Lock()   # the ring is single-stream: one generation at a time
@@ -55,7 +60,7 @@ def _connect(timeout):
     SOCKS.update(pipe=pipe, ret=ret)
 
 
-def generate(messages, tools, max_new, on_commit, timeout=1800):
+def generate(messages, tools, max_new, on_commit, timeout=1800, reasoning=True):
     """Run one chat completion through the ring (or a canned reply in MOCK). Returns the
     coordinate_pipe result dict ({text, n_tokens, prompt_tokens, tok_s, mean_accept, ...})."""
     if MOCK:
@@ -67,7 +72,7 @@ def generate(messages, tools, max_new, on_commit, timeout=1800):
             drafter = NgramDrafter(ng=A.ngram_n)
             return coordinate_pipe(SOCKS["pipe"], tok, messages, A.K, max_new, timeout, A.depth,
                                    ret_sock=SOCKS["ret"], local_draft=drafter, tools=tools,
-                                   prefill_chunk=4096, max_ctx=A.max_ctx, on_commit=on_commit)
+                                   prefill_chunk=4096, max_ctx=A.max_ctx, on_commit=on_commit, reasoning=reasoning)
         except Exception:
             SOCKS.clear()
             if attempt == 2:
@@ -148,13 +153,19 @@ class H(BaseHTTPRequestHandler):
             tools = None
         max_new = int(body.get("max_tokens") or body.get("max_completion_tokens") or 512)
         stream = bool(body.get("stream"))
+        if body.get("reasoning") is not None:                    # explicit bool override
+            reasoning = bool(body.get("reasoning"))
+        elif body.get("reasoning_effort") is not None:           # OpenAI-style: "none" -> off
+            reasoning = body.get("reasoning_effort") != "none"
+        else:
+            reasoning = DEFAULT_REASONING
         cid = f"chatcmpl-{next(_ids)}"; created = int(time.time())
         try:
             with RING_LOCK:
                 if stream:
-                    self._stream(cid, created, messages, tools, max_new)
+                    self._stream(cid, created, messages, tools, max_new, reasoning)
                 else:
-                    self._complete(cid, created, messages, tools, max_new)
+                    self._complete(cid, created, messages, tools, max_new, reasoning)
         except BrokenPipeError:
             pass
         except Exception as e:
@@ -162,8 +173,8 @@ class H(BaseHTTPRequestHandler):
             try: self._json(err, 500)
             except Exception: pass
 
-    def _complete(self, cid, created, messages, tools, max_new):
-        r = generate(messages, tools, max_new, on_commit=None)
+    def _complete(self, cid, created, messages, tools, max_new, reasoning=True):
+        r = generate(messages, tools, max_new, on_commit=None, reasoning=reasoning)
         parsed = parse_completion(r["text"])
         msg, finish = to_openai_message(parsed)
         if not (tools and parsed["tool_calls"]) and finish == "tool_calls":
@@ -178,7 +189,7 @@ class H(BaseHTTPRequestHandler):
                         "receipts_ok": r.get("receipts_ok"), "n_receipts": len(r.get("receipts") or [])},
         })
 
-    def _stream(self, cid, created, messages, tools, max_new):
+    def _stream(self, cid, created, messages, tools, max_new, reasoning=True):
         self.close_connection = True   # no chunked framing -> close at end so clients get clean EOF after [DONE]
         self.send_response(200); self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache"); self.send_header("Connection", "close")
@@ -199,7 +210,7 @@ class H(BaseHTTPRequestHandler):
             if len(content) > state["c"]:
                 chunk({"content": content[state["c"]:]}); state["c"] = len(content)
 
-        r = generate(messages, tools, max_new, on_commit=on_commit)
+        r = generate(messages, tools, max_new, on_commit=on_commit, reasoning=reasoning)
         parsed = parse_completion(r["text"])
         # flush any tail not yet streamed (final trimmed text), then tool calls
         _, fcontent = _split_stream(r["text"])
