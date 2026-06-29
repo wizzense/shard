@@ -17,14 +17,27 @@
 draftable output ⊕ **EAGLE-3** for novel reasoning, run coordinator-side (aux hidden states ride the verify
 return — no extra round-trip). Lossless (ring greedy-verifies).
 
-**NEXT ACTION:** vLLM EAGLE-3 **GO/NO-GO** — run `research/m25_eagle_gonogo.py` on ONE multi-GPU box
-(M2.5-NVFP4 needs Blackwell; vLLM's eagle3 does TREE drafting natively → gives the real **tree** accept-length
-on M2.5 *reasoning*, the number that justifies building our own tree-verify). GATE: reasoning accept ≈ 2.5
-(chain) / 4–5 (tree) → GO; ≈ 1 or regresses on long ctx → debug/reconsider before the big ring build.
-**Then:** validate our chain EagleDrafter (branch=1) on the engine → build tree-verify → wrap HybridDrafter.
+**GO signal is already IN (no vLLM re-measure needed):** thoughtworks published EAGLE-3-on-M2.5 = 2.11×
+HumanEval / 1.78× MT-bench (≈ ~2.5 reasoning accept) — the head's own authors confirmed it works. So **GO** on
+building the integration; the *real* accept number now comes from OUR engine.
 
-**BLOCKER this session:** vast handed 4 dud boxes (broken DNS, hf_transfer stall, sshd-won't-accept-key).
-ALWAYS verify SSH + raw HF speed UPFRONT before the 115 GB pull (see OPS PLAYBOOK). 0 instances live now.
+**NEXT ACTION:** validate the EAGLE HybridDrafter on **OUR pipeline engine** (NOT vLLM — see DEAD END below).
+Steps: (1) finish the last wiring — construct `HybridDrafter(NgramDrafter, EagleDrafter(eagle_dir, m25_embed))`
+in the coordinator when `M25_EAGLE=1` (in `_run_job`/`coord`/gateway + the benchmarks; load M2.5 `embed_tokens`
++ the head on the coordinator GPU). (2) Run our engine as a **localhost 8-GPU pipeline** (no WAN, no P2P) on
+one multi-5090 box: 8 stage procs (`CUDA_VISIBLE_DEVICES=i`, raw-wire), coordinator runs `m25_honest_bench.py`
+with `M25_EAGLE=1`. (3) GATE: does reasoning n-gram-accept 0 → EAGLE-accept ~2.5? If yes → build tree-verify
+(roadmap #2). Localhost pipeline gives the ACCEPT (workload-dependent) cleanly; WAN tok/s is a separate ring run.
+
+**DEAD END found (don't repeat): vLLM M2.5 under TP requires GPU P2P** — `MiniMaxText01RMSNormTP` uses a
+Lamport/IPC all-reduce → `cudaErrorPeerAccessUnsupported (217)` on consumer-5090 hosts w/o NVLink + ACS-blocked
+PCIe (most vast boxes). `NCCL_P2P_DISABLE`/`VLLM_DISABLE_CUSTOM_ALL_REDUCE` DON'T fix it (separate path). So
+can't GO/NO-GO via vLLM TP on typical vast hosts. Our PIPELINE engine avoids it (point-to-point sockets). If
+vLLM-on-M2.5 is ever needed, the host must support P2P (NVLink box, or ACS-disabled — unverifiable pre-rent).
+
+**OPS this session:** vast handed ~5 dud boxes (broken DNS, hf_transfer stall, sshd-won't-load-key, stuck
+"loading", P2P-less). The verify-gate (`scratchpad/verify_box.sh`: wait-running → SSH-retry → HF-speed → destroy
+on dud) made duds CHEAP (~$0.30 each). Parallel hf_transfer hit ~120 MB/s (130 GB in ~18 min) once on a good box.
 
 ---
 
